@@ -7,9 +7,9 @@ import (
 
 func main() {
 	name := os.Args[1:2][0]
-	packet, err := executeQuery("198.41.0.4:53", name, TypeA)
+	ip, err := resolve(name, TypeA)
 	if err != nil {
 		log.Fatalf("failed to execute query: %v", err)
 	}
-	log.Println(packet.toString())
+	log.Printf("resolved: %v", ip)
 }

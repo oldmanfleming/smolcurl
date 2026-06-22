@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 )
 
+const RootNameServer string = "198.41.0.4"
 const RecursionDesired uint16 = 1 << 8
 const RecursionNotDesired uint16 = 0 << 8
 const ClassIn = 1
@@ -16,12 +19,48 @@ const TypeA = 1
 const TypeNS = 2
 const TypeTxt = 16
 
+var NotFound = errors.New("not found")
+
+func resolve(name string, recordType uint16) (string, error) {
+	nameserver := RootNameServer
+	for true {
+		log.Printf("querying: %v", nameserver)
+		packet, err := executeQuery(nameserver, name, recordType)
+		if err != nil {
+			return "", fmt.Errorf("executing query: %w", err)
+		}
+		ip, err := getFirstIP(packet.answers)
+		if err == nil {
+			return ip, nil
+		}
+		if err != NotFound {
+			return "", fmt.Errorf("getting IP: %w", err)
+		}
+		nameserverIP, err := getFirstIP(packet.additionals)
+		if err == nil {
+			nameserver = nameserverIP
+			continue
+		}
+		if err != NotFound {
+			return "", fmt.Errorf("getting additional nameserver: %w", err)
+		}
+		ns, err := getFirstNameserver(packet.authorities)
+		// Once we get to checkiing authorities, we expect to find something
+		// Anything else is an error
+		if err != nil {
+			return "", fmt.Errorf("getting authoritative nameserver: %w", err)
+		}
+		nameserver = ns
+	}
+	return "", fmt.Errorf("unreachable: could not resolve name")
+}
+
 func executeQuery(address string, name string, recordType uint16) (dnsPacket, error) {
 	query, err := buildQuery(name, recordType)
 	if err != nil {
 		return dnsPacket{}, fmt.Errorf("failed to build query: %v", err)
 	}
-	conn, err := net.Dial("udp", address)
+	conn, err := net.Dial("udp", fmt.Sprintf("%v:53", address))
 	if err != nil {
 		return dnsPacket{}, fmt.Errorf("failed to open connection: %v", err)
 	}
@@ -41,6 +80,24 @@ func executeQuery(address string, name string, recordType uint16) (dnsPacket, er
 		return dnsPacket{}, fmt.Errorf("failed to parse packet: %v", err)
 	}
 	return packet, nil
+}
+
+func getFirstIP(records []dnsRecord) (string, error) {
+	for _, r := range records {
+		if r.Type_ == TypeA {
+			return formatIP(r.Data), nil
+		}
+	}
+	return "", NotFound
+}
+
+func getFirstNameserver(records []dnsRecord) (string, error) {
+	for _, r := range records {
+		if r.Type_ == TypeNS {
+			return fmt.Sprintf("%s", r.Data), nil
+		}
+	}
+	return "", NotFound
 }
 
 func buildQuery(domainName string, recordType uint16) ([]byte, error) {
