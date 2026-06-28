@@ -1,3 +1,3 @@
-# smoldns
+# smolcurl
 
-Learning dns things
+Learning networking things

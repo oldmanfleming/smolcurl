@@ -1,3 +1,3 @@
-module github.com/smoldns
+module github.com/smolcurl
 
 go 1.26.4
