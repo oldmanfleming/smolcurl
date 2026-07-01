@@ -6,10 +6,10 @@ import (
 )
 
 func main() {
-	name := os.Args[1:2][0]
-	ip, err := resolve(name, TypeA)
+	url := os.Args[1:2][0]
+	resp, err := get(url)
 	if err != nil {
-		log.Fatalf("failed to execute query: %v", err)
+		log.Fatalf("could not get from url: %v %v", url, err)
 	}
-	log.Printf("resolved: %v", ip)
+	log.Printf("response: %v", resp)
 }
