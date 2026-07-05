@@ -7,9 +7,9 @@ import (
 
 func main() {
 	url := os.Args[1:2][0]
-	resp, err := get(url)
+	resp, err := send(url)
 	if err != nil {
-		log.Fatalf("could not get from url: %v %v", url, err)
+		log.Fatalf("could not send for url: %v %v", url, err)
 	}
 	log.Printf("response: %v", resp)
 }
