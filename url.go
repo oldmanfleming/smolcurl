@@ -35,10 +35,10 @@ func parseURL(rawURL string) (URL, error) {
 		return URL{}, errors.New("empty host")
 	} else if i > 0 {
 		hostport = rest[:i]
-		path = rest[i+1:]
+		path = rest[i:]
 	} else {
 		hostport = rest
-		path = ""
+		path = "/"
 	}
 
 	host, port, err = parseHostPort(scheme, hostport)

@@ -7,7 +7,7 @@ import (
 
 func main() {
 	url := os.Args[1:2][0]
-	resp, err := send(url)
+	resp, err := send("GET", url)
 	if err != nil {
 		log.Fatalf("could not send for url: %v %v", url, err)
 	}
