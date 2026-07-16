@@ -12,7 +12,6 @@ use crate::http::send;
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let url = args.get(1).ok_or(anyhow!("missing url"))?;
-    let resp = send("GET", url)?;
-    println!("response: {}", resp);
+    send("GET", url)?;
     Ok(())
 }
