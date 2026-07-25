@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     net::TcpStream,
     string::String,
 };
@@ -144,13 +144,7 @@ pub fn send(req: Request) -> Result<Response, Error> {
         req.url.path
     );
 
-    let mut stream = connect(&req.url.host, req.url.port)?;
-
-    println!(
-        "oppened connection: {} - {}",
-        stream.local_addr()?,
-        stream.peer_addr()?
-    );
+    let mut stream = connect(&req.url)?;
 
     println!("sending request: \n{:?}", req);
 
@@ -162,13 +156,13 @@ pub fn send(req: Request) -> Result<Response, Error> {
     Ok(resp)
 }
 
-fn exec(mut stream: &mut TcpStream, req: Request) -> Result<Response, Error> {
-    let mut writer = BufWriter::new(&mut stream);
+fn exec<T: Read + Write>(stream: &mut T, req: Request) -> Result<Response, Error> {
+    let mut writer = BufWriter::new(&mut *stream);
     req.write_to(&mut writer)?;
     writer.flush()?;
     drop(writer);
 
-    let mut reader = BufReader::new(&mut stream);
+    let mut reader = BufReader::new(&mut *stream);
     let resp = Response::read_from(&mut reader)?;
 
     Ok(resp)

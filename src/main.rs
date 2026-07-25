@@ -1,5 +1,6 @@
 mod http;
 mod resolver;
+mod tls;
 mod transport;
 mod url;
 

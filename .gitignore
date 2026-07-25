@@ -1,6 +1,3 @@
 smoldns
-
-
-# Added by cargo
-
 /target
+/specs
