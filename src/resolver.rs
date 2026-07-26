@@ -9,94 +9,6 @@ const MAX_DEPTH: u8 = 10;
 const MAX_DELEGATIONS: u8 = 10;
 const ROOT_NAME_SERVER: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4));
 
-#[derive(Debug, Clone, Copy)]
-pub enum RecordKind {
-    A,
-    NS,
-    Txt,
-    Other(u16), // A catch-all for yet-to-be supported record types; holds its raw value
-}
-
-impl RecordKind {
-    fn encode(&self) -> u16 {
-        match self {
-            Self::A => 1,
-            Self::NS => 2,
-            Self::Txt => 16,
-            Self::Other(val) => *val,
-        }
-    }
-
-    fn decode(val: u16) -> Self {
-        match val {
-            1 => Self::A,
-            2 => Self::NS,
-            16 => Self::Txt,
-            i => Self::Other(i),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RecordClass {
-    IN,
-    Other(u16), // A catch-all for yet-to-be suppported record classes; holds its raw value
-}
-
-impl RecordClass {
-    fn encode(&self) -> u16 {
-        match self {
-            Self::IN => 1,
-            Self::Other(val) => *val,
-        }
-    }
-
-    fn decode(val: u16) -> Self {
-        match val {
-            1 => Self::IN,
-            val => Self::Other(val),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RecordData {
-    A(Ipv4Addr),
-    NS(String),
-    Txt(String),
-    Other(Vec<u8>), // A catch-all for yet-to-be supported record types; holds its raw data
-}
-
-struct DNSPacket {
-    header: DNSHeader,
-    questions: Vec<DNSQuestion>,
-    answers: Vec<DNSRecord>,
-    authorities: Vec<DNSRecord>,
-    additionals: Vec<DNSRecord>,
-}
-
-struct DNSHeader {
-    id: u16,
-    flags: u16,
-    num_questions: u16,
-    num_answers: u16,
-    num_authorities: u16,
-    num_additionals: u16,
-}
-
-struct DNSQuestion {
-    name: String,
-    kind: RecordKind,
-    class: RecordClass,
-}
-
-struct DNSRecord {
-    name: String,
-    class: RecordClass,
-    ttl: u32,
-    data: RecordData,
-}
-
 pub fn resolve(name: &str, kind: RecordKind) -> Result<IpAddr, Error> {
     resolve_inner(name, kind, 0)
 }
@@ -129,12 +41,12 @@ fn resolve_inner(name: &str, kind: RecordKind, depth: u8) -> Result<IpAddr, Erro
     Err(anyhow!("reached max delegation depth"))
 }
 
-fn query(addr: IpAddr, name: &str, kind: RecordKind) -> Result<DNSPacket, Error> {
+fn query(addr: IpAddr, name: &str, kind: RecordKind) -> Result<DnsPacket, Error> {
     let id = rand::random();
 
     let mut buf = [0u8; 512];
 
-    let query = DNSWriter::new(&mut buf).build_query(id, name, kind)?;
+    let query = DnsWriter::new(&mut buf).build_query(id, name, kind)?;
 
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -148,7 +60,7 @@ fn query(addr: IpAddr, name: &str, kind: RecordKind) -> Result<DNSPacket, Error>
         return Err(anyhow!("received unexpected response from: {src}"));
     }
 
-    let packet = DNSReader::new(&buf[..n]).decode_packet()?;
+    let packet = DnsReader::new(&buf[..n]).decode_packet()?;
 
     if id != packet.header.id {
         return Err(anyhow!(
@@ -161,26 +73,26 @@ fn query(addr: IpAddr, name: &str, kind: RecordKind) -> Result<DNSPacket, Error>
     Ok(packet)
 }
 
-fn get_first_ip(records: Vec<DNSRecord>) -> Option<IpAddr> {
+fn get_first_ip(records: Vec<DnsRecord>) -> Option<IpAddr> {
     records.into_iter().find_map(|r| match r.data {
         RecordData::A(ip) => Some(IpAddr::from(ip)),
         _ => None,
     })
 }
 
-fn get_first_nameserver(records: Vec<DNSRecord>) -> Option<String> {
+fn get_first_nameserver(records: Vec<DnsRecord>) -> Option<String> {
     records.into_iter().find_map(|r| match r.data {
         RecordData::NS(ns) => Some(ns),
         _ => None,
     })
 }
 
-struct DNSWriter<'a> {
+struct DnsWriter<'a> {
     data: &'a mut [u8],
     pos: usize,
 }
 
-impl<'a> DNSWriter<'a> {
+impl<'a> DnsWriter<'a> {
     fn new(data: &'a mut [u8]) -> Self {
         Self { data, pos: 0 }
     }
@@ -225,24 +137,24 @@ impl<'a> DNSWriter<'a> {
     }
 }
 
-struct DNSReader<'a> {
+struct DnsReader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
-impl<'a> DNSReader<'a> {
+impl<'a> DnsReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    fn decode_packet(mut self) -> Result<DNSPacket, Error> {
+    fn decode_packet(mut self) -> Result<DnsPacket, Error> {
         let header = self.decode_header()?;
         let questions = self.decode_questions(header.num_questions)?;
         let answers = self.decode_records(header.num_answers)?;
         let authorities = self.decode_records(header.num_authorities)?;
         let additionals = self.decode_records(header.num_additionals)?;
 
-        Ok(DNSPacket {
+        Ok(DnsPacket {
             header,
             questions,
             answers,
@@ -251,8 +163,8 @@ impl<'a> DNSReader<'a> {
         })
     }
 
-    fn decode_header(&mut self) -> Result<DNSHeader, Error> {
-        Ok(DNSHeader {
+    fn decode_header(&mut self) -> Result<DnsHeader, Error> {
+        Ok(DnsHeader {
             id: self.decode_u16()?,
             flags: self.decode_u16()?,
             num_questions: self.decode_u16()?,
@@ -262,30 +174,30 @@ impl<'a> DNSReader<'a> {
         })
     }
 
-    fn decode_questions(&mut self, n: u16) -> Result<Vec<DNSQuestion>, Error> {
+    fn decode_questions(&mut self, n: u16) -> Result<Vec<DnsQuestion>, Error> {
         (0..n).map(|_| self.decode_question()).collect()
     }
 
-    fn decode_question(&mut self) -> Result<DNSQuestion, Error> {
-        Ok(DNSQuestion {
+    fn decode_question(&mut self) -> Result<DnsQuestion, Error> {
+        Ok(DnsQuestion {
             name: self.decode_name()?,
             kind: RecordKind::decode(self.decode_u16()?),
             class: RecordClass::decode(self.decode_u16()?),
         })
     }
 
-    fn decode_records(&mut self, n: u16) -> Result<Vec<DNSRecord>, Error> {
+    fn decode_records(&mut self, n: u16) -> Result<Vec<DnsRecord>, Error> {
         (0..n).map(|_| self.decode_record()).collect()
     }
 
-    fn decode_record(&mut self) -> Result<DNSRecord, Error> {
+    fn decode_record(&mut self) -> Result<DnsRecord, Error> {
         let name = self.decode_name()?;
         let kind = RecordKind::decode(self.decode_u16()?);
         let class = RecordClass::decode(self.decode_u16()?);
         let ttl = self.decode_u32()?;
         let data = self.decode_data(kind)?;
 
-        Ok(DNSRecord {
+        Ok(DnsRecord {
             name,
             class,
             ttl,
@@ -341,11 +253,12 @@ impl<'a> DNSReader<'a> {
             RecordKind::NS => Ok(RecordData::NS(self.decode_name()?)),
             RecordKind::Txt => {
                 let data = self.get_bytes(len)?.to_vec();
-                Ok(RecordData::Txt(String::from_utf8(data)?))
+                let _ = String::from_utf8(data)?; // for future use
+                Ok(RecordData::Txt(()))
             }
             _ => {
-                let data = self.get_bytes(len)?.to_vec();
-                Ok(RecordData::Other(data))
+                let _ = self.get_bytes(len)?.to_vec(); // for future use
+                Ok(RecordData::Other(()))
             }
         }
     }
@@ -375,4 +288,100 @@ impl<'a> DNSReader<'a> {
         self.pos += len;
         Ok(bytes)
     }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DnsPacket {
+    header: DnsHeader,
+    questions: Vec<DnsQuestion>,
+    answers: Vec<DnsRecord>,
+    authorities: Vec<DnsRecord>,
+    additionals: Vec<DnsRecord>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DnsHeader {
+    id: u16,
+    flags: u16,
+    num_questions: u16,
+    num_answers: u16,
+    num_authorities: u16,
+    num_additionals: u16,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DnsQuestion {
+    name: String,
+    kind: RecordKind,
+    class: RecordClass,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct DnsRecord {
+    name: String,
+    class: RecordClass,
+    ttl: u32,
+    data: RecordData,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RecordKind {
+    A,
+    NS,
+    Txt,
+    Other(u16), // A catch-all for yet-to-be supported record types; holds its raw value
+}
+
+impl RecordKind {
+    fn encode(&self) -> u16 {
+        match self {
+            Self::A => 1,
+            Self::NS => 2,
+            Self::Txt => 16,
+            Self::Other(val) => *val,
+        }
+    }
+
+    fn decode(val: u16) -> Self {
+        match val {
+            1 => Self::A,
+            2 => Self::NS,
+            16 => Self::Txt,
+            i => Self::Other(i),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RecordClass {
+    IN,
+    Other(u16), // A catch-all for yet-to-be suppported record classes; holds its raw value
+}
+
+impl RecordClass {
+    fn encode(&self) -> u16 {
+        match self {
+            Self::IN => 1,
+            Self::Other(val) => *val,
+        }
+    }
+
+    fn decode(val: u16) -> Self {
+        match val {
+            1 => Self::IN,
+            val => Self::Other(val),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RecordData {
+    A(Ipv4Addr),
+    NS(String),
+    Txt(()),
+    Other(()), // A catch-all for yet-to-be supported record types; holds its raw data
 }

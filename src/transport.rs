@@ -8,39 +8,9 @@ use anyhow::{Error, anyhow};
 
 use crate::{
     resolver::{RecordKind, resolve},
-    tls::stream::TlsStream,
+    tls::stream::{TlsStream, handshake},
     url::{Scheme, URL},
 };
-
-enum Transport {
-    Plain(TcpStream),
-    TLS(TlsStream),
-}
-
-impl Read for Transport {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Plain(stream) => stream.read(buf),
-            Self::TLS(stream) => stream.read(buf),
-        }
-    }
-}
-
-impl Write for Transport {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Plain(stream) => stream.write(buf),
-            Self::TLS(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Plain(stream) => stream.flush(),
-            Self::TLS(stream) => stream.flush(),
-        }
-    }
-}
 
 pub fn connect(url: &URL) -> Result<impl Read + Write + use<>, Error> {
     let ip = resolve_ip(&url.host)?;
@@ -56,8 +26,8 @@ pub fn connect(url: &URL) -> Result<impl Read + Write + use<>, Error> {
     );
 
     match url.scheme {
-        Scheme::HTTP => Ok(Transport::Plain(stream)),
-        Scheme::HTTPS => Ok(Transport::TLS(TlsStream::handshake(stream, &url.host)?)),
+        Scheme::Http => Ok(Transport::Plain(stream)),
+        Scheme::Https => Ok(Transport::Tls(handshake(stream, &url.host)?)),
     }
 }
 
@@ -67,6 +37,36 @@ fn resolve_ip(host: &str) -> Result<IpAddr, Error> {
         Err(_) => {
             let addr = resolve(host, RecordKind::A)?;
             Ok(IpAddr::from(addr))
+        }
+    }
+}
+
+enum Transport {
+    Plain(TcpStream),
+    Tls(TlsStream),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }

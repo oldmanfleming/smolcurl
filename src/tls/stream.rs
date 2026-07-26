@@ -3,25 +3,32 @@ use std::{
     net::TcpStream,
 };
 
-use anyhow::Error;
+use anyhow::{Error, anyhow};
 
 const LEGACY_RECORD_VERSION: u16 = 0x0303;
 
-pub struct TlsStream {
-    inner: TcpStream,
+pub fn handshake(mut stream: TcpStream, _hostname: &str) -> Result<TlsStream, Error> {
+    let mut buf = [0u8; 512];
+    let req = TlsWriter::new(&mut buf).encode_record(Record {
+        content_type: ContentType::Handshake,
+        length: 0,
+        fragment: vec![],
+    })?;
+
+    println!("handshake req: {:?}", req);
+    stream.write_all(req)?;
+
+    // wip...
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp)?;
+    println!("handshake resp: {:?}", resp);
+    // ...
+
+    Ok(TlsStream { inner: stream })
 }
 
-impl TlsStream {
-    pub fn handshake(stream: TcpStream, hostname: &str) -> Result<Self, Error> {
-        let handshake = Record {
-            content_type: ContentType::HANDSHAKE,
-            version: ProtocolVersion::TLS1_2,
-            length: 0,
-            fragment: vec![],
-        };
-
-        Ok(Self { inner: stream })
-    }
+pub struct TlsStream {
+    inner: TcpStream,
 }
 
 impl Read for TlsStream {
@@ -42,31 +49,47 @@ impl Write for TlsStream {
 
 struct Record {
     content_type: ContentType,
-    version: ProtocolVersion,
     length: u16,
     fragment: Vec<u8>,
 }
 
 enum ContentType {
-    HANDSHAKE,
+    Handshake,
 }
 
 impl ContentType {
-    fn encode(&self) -> u8 {
+    fn encode(&self) -> [u8; 1] {
         match self {
-            Self::HANDSHAKE => 0x16,
+            Self::Handshake => 0x16u8.to_be_bytes(),
         }
     }
 }
 
-enum ProtocolVersion {
-    TLS1_2,
+struct TlsWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
 }
 
-impl ProtocolVersion {
-    fn encode(&self) -> u16 {
-        match self {
-            Self::TLS1_2 => 0x0303,
-        }
+impl<'a> TlsWriter<'a> {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    pub fn encode_record(mut self, record: Record) -> Result<&'a [u8], Error> {
+        self.set_bytes(&record.content_type.encode())?;
+        self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
+        self.set_bytes(&record.length.to_be_bytes())?;
+        self.set_bytes(&record.fragment.as_slice())?;
+        Ok(&self.buf[0..self.pos])
+    }
+
+    fn set_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
+        let slot = self
+            .buf
+            .get_mut(self.pos..self.pos + data.len())
+            .ok_or_else(|| anyhow!("unexpected end of buf"))?;
+        slot.copy_from_slice(data);
+        self.pos += data.len();
+        Ok(())
     }
 }

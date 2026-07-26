@@ -2,37 +2,14 @@ use std::fmt;
 
 use anyhow::{Error, anyhow, bail};
 
-#[derive(Debug)]
-pub struct URL {
-    pub scheme: Scheme,
-    pub host: String,
-    pub port: u16,
-    pub path: String,
-}
-
-#[derive(Debug)]
-pub enum Scheme {
-    HTTP,
-    HTTPS,
-}
-
-impl fmt::Display for Scheme {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Scheme::HTTP => write!(f, "http"),
-            Scheme::HTTPS => write!(f, "https"),
-        }
-    }
-}
-
 pub fn parse_url(url: &str) -> Result<URL, Error> {
     if url.is_empty() {
         bail!("url can not be empty");
     }
 
     let (scheme, rest) = match parse_scheme(url)? {
-        ("http", rest) => (Scheme::HTTP, rest),
-        ("https", rest) => (Scheme::HTTPS, rest),
+        ("http", rest) => (Scheme::Http, rest),
+        ("https", rest) => (Scheme::Https, rest),
         _ => bail!("Unsupported scheme"),
     };
 
@@ -91,8 +68,8 @@ fn parse_hostport<'a>(scheme: &Scheme, hostport: &'a str) -> Result<(&'a str, u1
 
 fn resolve_port(scheme: &Scheme) -> u16 {
     match scheme {
-        Scheme::HTTP => 80,
-        Scheme::HTTPS => 553,
+        Scheme::Http => 80,
+        Scheme::Https => 553,
     }
 }
 
@@ -100,5 +77,28 @@ fn parse_port(port_str: &str) -> Result<u16, Error> {
     match port_str.parse::<u16>() {
         Ok(port) => Ok(port),
         Err(e) => Err(anyhow!("bad port: {} {}", port_str, e)),
+    }
+}
+
+#[derive(Debug)]
+pub struct URL {
+    pub scheme: Scheme,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+#[derive(Debug)]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+impl fmt::Display for Scheme {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Scheme::Http => write!(f, "http"),
+            Scheme::Https => write!(f, "https"),
+        }
     }
 }

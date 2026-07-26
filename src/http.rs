@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::{BufRead, BufReader, BufWriter, Read, Write},
-    net::TcpStream,
     string::String,
+    write,
 };
 
 use anyhow::{Error, anyhow, bail};
@@ -15,15 +16,39 @@ use crate::{
 const HTTP_V1_1: &str = "HTTP/1.1";
 const HTTP_V1_0: &str = "HTTP/1.0";
 
+pub fn send(req: Request) -> Result<Response, Error> {
+    let mut stream = connect(&req.url)?;
+
+    println!("sending request: {}", req);
+
+    let resp = exec(&mut stream, req)?;
+
+    println!("received response: {}", resp);
+
+    Ok(resp)
+}
+
+fn exec<T: Read + Write>(stream: &mut T, req: Request) -> Result<Response, Error> {
+    let mut writer = BufWriter::new(&mut *stream);
+    req.write_to(&mut writer)?;
+    writer.flush()?;
+    drop(writer);
+
+    let mut reader = BufReader::new(&mut *stream);
+    let resp = Response::read_from(&mut reader)?;
+
+    Ok(resp)
+}
+
 #[derive(Debug)]
 pub enum Method {
-    GET,
+    Get,
 }
 
 impl Method {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::GET => "GET",
+            Self::Get => "GET",
         }
     }
 }
@@ -71,6 +96,21 @@ impl Request {
     }
 }
 
+impl Display for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {:?}",
+            self.method.as_str(),
+            self.url.scheme,
+            self.url.host,
+            self.url.port,
+            self.url.path,
+            self.headers
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct Response {
     version: String,
@@ -113,7 +153,7 @@ impl Response {
         let body = match headers.get("content-length") {
             Some(cl) => {
                 let len = cl.parse::<usize>()?;
-                let mut buf = vec![0u8; len];
+                let mut buf: Vec<u8> = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
                 buf
             }
@@ -134,36 +174,16 @@ impl Response {
     }
 }
 
-pub fn send(req: Request) -> Result<Response, Error> {
-    println!(
-        "parsed method: {}, scheme: {}, host: {}, port: {}, path: {}",
-        req.method.as_str(),
-        req.url.scheme,
-        req.url.host,
-        req.url.port,
-        req.url.path
-    );
-
-    let mut stream = connect(&req.url)?;
-
-    println!("sending request: \n{:?}", req);
-
-    let resp = exec(&mut stream, req)?;
-
-    println!("received response: \n{:?}", resp);
-    println!("with body: {}", str::from_utf8(resp.body.as_slice())?);
-
-    Ok(resp)
-}
-
-fn exec<T: Read + Write>(stream: &mut T, req: Request) -> Result<Response, Error> {
-    let mut writer = BufWriter::new(&mut *stream);
-    req.write_to(&mut writer)?;
-    writer.flush()?;
-    drop(writer);
-
-    let mut reader = BufReader::new(&mut *stream);
-    let resp = Response::read_from(&mut reader)?;
-
-    Ok(resp)
+impl Display for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {:?} {:?} {}",
+            self.version,
+            self.status,
+            self.msg,
+            self.headers,
+            String::from_utf8_lossy(self.body.as_slice())
+        )
+    }
 }
