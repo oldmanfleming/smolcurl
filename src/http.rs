@@ -19,11 +19,7 @@ const HTTP_V1_0: &str = "HTTP/1.0";
 pub fn send(req: Request) -> Result<Response, Error> {
     let mut stream = connect(&req.url)?;
 
-    println!("sending request: {}", req);
-
     let resp = exec(&mut stream, req)?;
-
-    println!("received response: {}", resp);
 
     Ok(resp)
 }

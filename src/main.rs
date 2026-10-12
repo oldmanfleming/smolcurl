@@ -14,6 +14,10 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let url = args.get(1).ok_or(anyhow!("missing url"))?;
     let req = Request::new(Method::Get, url, None)?;
-    send(req)?;
+    println!("sending request: {}", req);
+
+    let resp = send(req)?;
+
+    println!("received response: {}", resp);
     Ok(())
 }
