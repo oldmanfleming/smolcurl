@@ -107,24 +107,8 @@ impl<'a> TlsWriter<'a> {
     fn encode(mut self, record: Record) -> Result<&'a [u8], Error> {
         self.set_bytes(&Self::encode_content_type(&record).to_be_bytes())?;
         self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
-        let fragment = self.encode_fragment(record)?;
-        let len: u16 = fragment
-            .len()
-            .try_into()
-            .context("fragment len is too large")?;
-        self.set_bytes(&len.to_be_bytes())?;
-        self.set_bytes(&fragment.as_slice())?;
+        self.encode_fragment(record)?;
         Ok(&self.buf[0..self.pos])
-    }
-
-    fn set_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
-        let slot = self
-            .buf
-            .get_mut(self.pos..self.pos + data.len())
-            .context("unexpected end of buff")?;
-        slot.copy_from_slice(data);
-        self.pos += data.len();
-        Ok(())
     }
 
     fn encode_content_type(record: &Record) -> u8 {
@@ -137,16 +121,33 @@ impl<'a> TlsWriter<'a> {
         }
     }
 
-    fn encode_fragment(&mut self, record: Record) -> Result<Vec<u8>, Error> {
+    fn encode_fragment(&mut self, record: Record) -> Result<(), Error> {
+        // reserve len slots with saved positions
+        let len_pos = self.pos;
+        self.pos += 2;
+        let start_pos = self.pos;
+
         match record {
-            Record::Handshake(msg) => self.encode_msg(msg),
-            Record::Alert(atype, adesc) => Ok(vec![
+            Record::Handshake(msg) => self.encode_msg(msg)?,
+            Record::Alert(atype, adesc) => self.set_bytes(&[
                 Self::encode_alert_type(&atype),
                 Self::encode_alert_desc(&adesc),
-            ]),
-            Record::ChangeCipherSpec => Ok(vec![0x01, 0x01]),
+            ])?,
+            Record::ChangeCipherSpec => self.set_bytes(&[0x01, 0x01])?,
             _ => todo!(),
-        }
+        };
+
+        let len: u16 = (self.pos - start_pos)
+            .try_into()
+            .context("fragment len is too large")?;
+        let len_bytes = len.to_be_bytes();
+        let slot = self
+            .buf
+            .get_mut(len_pos..len_pos + 2)
+            .context("unexpected end of buff")?;
+        slot.copy_from_slice(&len_bytes);
+
+        Ok(())
     }
 
     fn encode_alert_type(atype: &AlertType) -> u8 {
@@ -169,31 +170,32 @@ impl<'a> TlsWriter<'a> {
         }
     }
 
-    fn encode_msg(&mut self, msg: HandshakeMsg) -> Result<Vec<u8>, Error> {
-        let mut buf: Vec<u8> = vec![];
+    fn encode_msg(&mut self, msg: HandshakeMsg) -> Result<(), Error> {
+        // reserve header slots (type and len) with saved positions
+        let header_pos = self.pos;
+        self.pos += 4;
+        let start_pos = self.pos;
 
         let htype: HandshakeType = match msg {
             HandshakeMsg::ClientHello(cipher_suite, extensions) => {
-                buf.write_all(&LEGACY_RECORD_VERSION.to_be_bytes())?;
+                self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
 
-                let mut random = vec![0u8; 32];
+                let mut random = [0u8; 32];
                 rand::fill(&mut random);
-                buf.write_all(&random)?;
+                self.set_bytes(&random)?;
 
                 // sending empty session id for simplicity
                 // in future we can send random 32 octets
                 // and validate echoed value from ServerHello
                 let legacy_session_id = 0x00u8.to_be_bytes();
-                Self::encode_data_u8(&mut buf, &legacy_session_id)?;
+                self.encode_data_u8(&legacy_session_id)?;
 
-                Self::encode_data_u16(&mut buf, &cipher_suite.to_be_bytes())?;
+                self.encode_data_u16(&cipher_suite.to_be_bytes())?;
 
                 // TLS1.3 does not allow compression
-                let compression = COMPRESSION_DISABLED.to_be_bytes();
-                Self::encode_data_u8(&mut buf, &compression)?;
+                self.encode_data_u8(&COMPRESSION_DISABLED.to_be_bytes())?;
 
-                let extensions = Self::encode_extensions(extensions)?;
-                Self::encode_data_u16(&mut buf, &extensions)?;
+                self.encode_extensions(extensions)?;
 
                 CLIENT_HELLO
             }
@@ -202,29 +204,41 @@ impl<'a> TlsWriter<'a> {
 
         // There is no native u24 type in rust, so parse as u32.
         // We then replace the first byte with the handshake type since it's not used
-        let len: u32 = buf.len().try_into()?;
-        let mut data = len.to_be_bytes().to_vec();
-        data[0] = htype;
-        data.extend_from_slice(&buf);
-
-        Ok(data)
+        let len: u32 = (self.pos - start_pos)
+            .try_into()
+            .context("msg len is too long")?;
+        let mut header = len.to_be_bytes();
+        header[0] = htype;
+        let slot = self
+            .buf
+            .get_mut(header_pos..header_pos + 4)
+            .context("unexpected end of buff")?;
+        slot.copy_from_slice(&header);
+        Ok(())
     }
 
-    fn encode_extensions(extensions: Vec<HandshakeExtension>) -> Result<Vec<u8>, Error> {
-        let mut buf: Vec<u8> = vec![];
+    fn encode_extensions(&mut self, extensions: Vec<HandshakeExtension>) -> Result<(), Error> {
+        // reserve len slot with saved positions
+        let len_pos = self.pos;
+        self.pos += 2;
+        let start_pos = self.pos;
 
         for ext in extensions {
-            buf.write_all(&Self::encode_extension_type(&ext).to_be_bytes())?;
-            let data = Self::encode_data(ext)?;
-            let len: u16 = data
-                .len()
-                .try_into()
-                .context("extension data len is too large")?;
-            buf.write_all(&len.to_be_bytes())?;
-            buf.write_all(&data)?;
+            self.set_bytes(&Self::encode_extension_type(&ext).to_be_bytes())?;
+            self.encode_extension_data(ext)?;
         }
 
-        Ok(buf)
+        let len: u16 = (self.pos - start_pos)
+            .try_into()
+            .context("extensions len is too large")?;
+        let len_bytes = len.to_be_bytes();
+        let slot = self
+            .buf
+            .get_mut(len_pos..len_pos + 2)
+            .context("unexpected end of buff")?;
+        slot.copy_from_slice(&len_bytes);
+
+        Ok(())
     }
 
     fn encode_extension_type(ext: &HandshakeExtension) -> u16 {
@@ -237,69 +251,82 @@ impl<'a> TlsWriter<'a> {
         }
     }
 
-    fn encode_data(ext: HandshakeExtension) -> Result<Vec<u8>, Error> {
+    fn encode_extension_data(&mut self, ext: HandshakeExtension) -> Result<(), Error> {
+        // reserve len slots with saved positions
+        let len_pos = self.pos;
+        self.pos += 2;
+        let start_pos = self.pos;
+
         let mut buf: Vec<u8> = vec![];
         match ext {
             HandshakeExtension::SupportedVersions(versions) => {
                 for v in versions {
                     buf.write_all(&v.to_be_bytes())?;
                 }
-                Self::encode_len_u8(&mut buf)
+                self.encode_data_u8(&mut buf)?;
             }
             HandshakeExtension::SupportedGroups(groups) => {
                 for g in groups {
                     buf.write_all(&g.to_be_bytes())?;
                 }
-                Self::encode_len_u16(&mut buf)
+                self.encode_data_u16(&mut buf)?;
             }
             HandshakeExtension::KeyShare(group, pub_key) => {
                 buf.write_all(&group.to_be_bytes())?;
                 let len: u16 = pub_key.len().try_into().context("pub key too long")?;
                 buf.write_all(&len.to_be_bytes())?;
                 buf.write_all(&pub_key)?;
-                Self::encode_len_u16(&mut buf)
+                self.encode_data_u16(&mut buf)?;
             }
             HandshakeExtension::SignatureAlgorithms(algs) => {
                 for a in algs {
                     buf.write_all(&a.to_be_bytes())?;
                 }
-                Self::encode_len_u16(&mut buf)
+                self.encode_data_u16(&mut buf)?;
             }
             HandshakeExtension::ServerName(name) => {
                 buf.push(HOST_NAME);
                 let len: u16 = name.len().try_into().context("hostname too long")?;
                 buf.write_all(&len.to_be_bytes())?;
                 buf.write_all(name.as_bytes())?;
-                Self::encode_len_u16(&mut buf)
+                self.encode_data_u16(&mut buf)?;
             }
-        }
-    }
+        };
 
-    fn encode_len_u8(buf: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
-        let len: u8 = buf.len().try_into()?;
-        let mut data = len.to_be_bytes().to_vec();
-        data.extend_from_slice(&buf);
-        Ok(data)
-    }
+        let len: u16 = (self.pos - start_pos)
+            .try_into()
+            .context("extension data len is too large")?;
+        let len_bytes = len.to_be_bytes();
+        let slot = self
+            .buf
+            .get_mut(len_pos..len_pos + 2)
+            .context("unexpected end of buff")?;
+        slot.copy_from_slice(&len_bytes);
 
-    fn encode_len_u16(buf: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
-        let len: u16 = buf.len().try_into()?;
-        let mut data = len.to_be_bytes().to_vec();
-        data.extend_from_slice(&buf);
-        Ok(data)
-    }
-
-    fn encode_data_u8(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
-        let len: u8 = data.len().try_into()?;
-        buf.write_all(&len.to_be_bytes())?;
-        buf.write_all(data)?;
         Ok(())
     }
 
-    fn encode_data_u16(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
+    fn encode_data_u8(&mut self, data: &[u8]) -> Result<(), Error> {
+        let len: u8 = data.len().try_into()?;
+        self.set_bytes(&len.to_be_bytes())?;
+        self.set_bytes(data)?;
+        Ok(())
+    }
+
+    fn encode_data_u16(&mut self, data: &[u8]) -> Result<(), Error> {
         let len: u16 = data.len().try_into()?;
-        buf.write_all(&len.to_be_bytes())?;
-        buf.write_all(data)?;
+        self.set_bytes(&len.to_be_bytes())?;
+        self.set_bytes(data)?;
+        Ok(())
+    }
+
+    fn set_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
+        let slot = self
+            .buf
+            .get_mut(self.pos..self.pos + data.len())
+            .context("unexpected end of buff")?;
+        slot.copy_from_slice(data);
+        self.pos += data.len();
         Ok(())
     }
 }
