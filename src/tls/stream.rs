@@ -6,8 +6,6 @@ use std::{
 
 use anyhow::{Context, Error, anyhow, bail};
 
-use crate::tls::stream::{HandshakeExtension::SupportedVersions, HandshakeMsg::ClientHello};
-
 type TlsVersion = u16;
 type CipherSuite = u16;
 type KeyGroup = u16;
@@ -102,14 +100,14 @@ struct TlsWriter<'a> {
 }
 
 impl<'a> TlsWriter<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
+    fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    pub fn encode(mut self, record: Record) -> Result<&'a [u8], Error> {
-        self.set_bytes(&record.encode_content_type().to_be_bytes())?;
+    fn encode(mut self, record: Record) -> Result<&'a [u8], Error> {
+        self.set_bytes(&Self::encode_content_type(&record).to_be_bytes())?;
         self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
-        let fragment = record.encode_fragment()?;
+        let fragment = self.encode_fragment(record)?;
         let len: u16 = fragment
             .len()
             .try_into()
@@ -128,96 +126,54 @@ impl<'a> TlsWriter<'a> {
         self.pos += data.len();
         Ok(())
     }
-}
 
-struct TlsReader<'a> {
-    buf: &'a [u8],
-    _pos: usize,
-}
-
-impl<'a> TlsReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, _pos: 0 }
-    }
-
-    fn decode(&self, ctype: u8, len: u16) -> Result<Record, Error> {
-        Ok(Record::decode(ctype, &self.buf[..usize::from(len)])?)
-    }
-}
-
-#[derive(Debug)]
-enum Record {
-    Invalid,
-    ChangeCipherSpec,
-    Alert(AlertType, AlertDescription),
-    Handshake(HandshakeMsg),
-    ApplicationData,
-}
-
-impl Record {
-    fn encode_content_type(&self) -> u8 {
-        match self {
-            Self::Invalid => 0x00,
-            Self::ChangeCipherSpec => 0x14,
-            Self::Alert(..) => 0x15,
-            Self::Handshake(..) => 0x16,
-            Self::ApplicationData => 0x17,
+    fn encode_content_type(record: &Record) -> u8 {
+        match record {
+            Record::Invalid => 0x00,
+            Record::ChangeCipherSpec => 0x14,
+            Record::Alert(..) => 0x15,
+            Record::Handshake(..) => 0x16,
+            Record::ApplicationData => 0x17,
         }
     }
 
-    fn encode_fragment(self) -> Result<Vec<u8>, Error> {
-        match self {
-            Self::Handshake(msg) => msg.encode(),
-            Self::Alert(atype, desc) => Ok(vec![atype.encode(), desc.encode()]),
-            Self::ChangeCipherSpec => Ok(vec![0x01, 0x01]),
+    fn encode_fragment(&mut self, record: Record) -> Result<Vec<u8>, Error> {
+        match record {
+            Record::Handshake(msg) => self.encode_msg(msg),
+            Record::Alert(atype, adesc) => Ok(vec![
+                Self::encode_alert_type(&atype),
+                Self::encode_alert_desc(&adesc),
+            ]),
+            Record::ChangeCipherSpec => Ok(vec![0x01, 0x01]),
             _ => todo!(),
         }
     }
 
-    fn decode(ctype: u8, fragment: &[u8]) -> Result<Self, Error> {
-        let res = match ctype {
-            0x00 => Self::Invalid,
-            0x14 => {
-                let [0x01, 0x01] = fragment else {
-                    bail!("unexpected change cipher spec format")
-                };
-                Self::ChangeCipherSpec
-            }
-            0x15 => {
-                let [atype, adesc, ..] = fragment else {
-                    bail!("alert response too short");
-                };
-                Self::Alert(AlertType::decode(*atype), AlertDescription::decode(*adesc))
-            }
-            0x16 => {
-                let msg = HandshakeMsg::decode(fragment)?;
-                Self::Handshake(msg)
-            }
-            0x17 => Self::ApplicationData,
-            other => bail!("unexpected response content type: {}", other),
-        };
-        Ok(res)
+    fn encode_alert_type(atype: &AlertType) -> u8 {
+        match atype {
+            AlertType::Warning => 0x01,
+            AlertType::Fatal => 0x02,
+            AlertType::Unknown(val) => *val,
+        }
     }
-}
 
-#[derive(Debug)]
-enum HandshakeMsg {
-    ClientHello(CipherSuite, Vec<HandshakeExtension>),
-    ServerHello,
-    _NewSessionTicket,
-    _EncryptedExtensions,
-    _Certificate,
-    _CertificateVerify,
-    _Finished,
-    _KeyUpdated,
-}
+    fn encode_alert_desc(adesc: &AlertDescription) -> u8 {
+        match adesc {
+            AlertDescription::HandshakeFailure => 0x28,
+            AlertDescription::IllegalParameter => 0x2f,
+            AlertDescription::DecodeError => 0x32,
+            AlertDescription::DecryptError => 0x33,
+            AlertDescription::ProtocolVersion => 0x46,
+            AlertDescription::MissingExtension => 0x6d,
+            AlertDescription::Unknown(val) => *val,
+        }
+    }
 
-impl HandshakeMsg {
-    fn encode(self) -> Result<Vec<u8>, Error> {
+    fn encode_msg(&mut self, msg: HandshakeMsg) -> Result<Vec<u8>, Error> {
         let mut buf: Vec<u8> = vec![];
 
-        let htype: HandshakeType = match self {
-            ClientHello(cipher_suite, extensions) => {
+        let htype: HandshakeType = match msg {
+            HandshakeMsg::ClientHello(cipher_suite, extensions) => {
                 buf.write_all(&LEGACY_RECORD_VERSION.to_be_bytes())?;
 
                 let mut random = vec![0u8; 32];
@@ -258,8 +214,8 @@ impl HandshakeMsg {
         let mut buf: Vec<u8> = vec![];
 
         for ext in extensions {
-            buf.write_all(&ext.encode_type().to_be_bytes())?;
-            let data = ext.encode_data()?;
+            buf.write_all(&Self::encode_extension_type(&ext).to_be_bytes())?;
+            let data = Self::encode_data(ext)?;
             let len: u16 = data
                 .len()
                 .try_into()
@@ -271,40 +227,9 @@ impl HandshakeMsg {
         Ok(buf)
     }
 
-    fn encode_data_u8(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
-        let len: u8 = data.len().try_into()?;
-        buf.write_all(&len.to_be_bytes())?;
-        buf.write_all(data)?;
-        Ok(())
-    }
-
-    fn encode_data_u16(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
-        let len: u16 = data.len().try_into()?;
-        buf.write_all(&len.to_be_bytes())?;
-        buf.write_all(data)?;
-        Ok(())
-    }
-
-    fn decode(fragment: &[u8]) -> Result<Self, Error> {
-        // TODO
-        println!("received server hello: {:?}", fragment);
-        Ok(HandshakeMsg::ServerHello)
-    }
-}
-
-#[derive(Debug)]
-enum HandshakeExtension {
-    SupportedVersions(Vec<TlsVersion>),
-    SupportedGroups(Vec<KeyGroup>),
-    KeyShare(KeyGroup, Vec<u8>),
-    SignatureAlgorithms(Vec<SignatureAlgorithm>),
-    ServerName(String),
-}
-
-impl HandshakeExtension {
-    fn encode_type(&self) -> u16 {
-        match self {
-            SupportedVersions(..) => 0x002b,
+    fn encode_extension_type(ext: &HandshakeExtension) -> u16 {
+        match ext {
+            HandshakeExtension::SupportedVersions(..) => 0x002b,
             HandshakeExtension::SupportedGroups(..) => 0x000a,
             HandshakeExtension::KeyShare(..) => 0x0033,
             HandshakeExtension::SignatureAlgorithms(..) => 0x000d,
@@ -312,10 +237,10 @@ impl HandshakeExtension {
         }
     }
 
-    fn encode_data(self) -> Result<Vec<u8>, Error> {
+    fn encode_data(ext: HandshakeExtension) -> Result<Vec<u8>, Error> {
         let mut buf: Vec<u8> = vec![];
-        match self {
-            SupportedVersions(versions) => {
+        match ext {
+            HandshakeExtension::SupportedVersions(versions) => {
                 for v in versions {
                     buf.write_all(&v.to_be_bytes())?;
                 }
@@ -363,6 +288,116 @@ impl HandshakeExtension {
         data.extend_from_slice(&buf);
         Ok(data)
     }
+
+    fn encode_data_u8(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
+        let len: u8 = data.len().try_into()?;
+        buf.write_all(&len.to_be_bytes())?;
+        buf.write_all(data)?;
+        Ok(())
+    }
+
+    fn encode_data_u16(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
+        let len: u16 = data.len().try_into()?;
+        buf.write_all(&len.to_be_bytes())?;
+        buf.write_all(data)?;
+        Ok(())
+    }
+}
+
+struct TlsReader<'a> {
+    buf: &'a [u8],
+    _pos: usize,
+}
+
+impl<'a> TlsReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, _pos: 0 }
+    }
+
+    fn decode(&self, ctype: u8, len: u16) -> Result<Record, Error> {
+        let fragment = &self.buf[..usize::from(len)];
+        let res = match ctype {
+            0x00 => Record::Invalid,
+            0x14 => {
+                let [0x01, 0x01] = fragment else {
+                    bail!("unexpected change cipher spec format")
+                };
+                Record::ChangeCipherSpec
+            }
+            0x15 => {
+                let [atype, adesc, ..] = fragment else {
+                    bail!("alert response too short");
+                };
+                Record::Alert(
+                    Self::decode_alert_type(*atype),
+                    Self::decode_alert_desc(*adesc),
+                )
+            }
+            0x16 => {
+                let msg = Self::decode_handshake_msg(fragment)?;
+                Record::Handshake(msg)
+            }
+            0x17 => Record::ApplicationData,
+            other => bail!("unexpected response content type: {}", other),
+        };
+        Ok(res)
+    }
+
+    fn decode_alert_type(val: u8) -> AlertType {
+        match val {
+            0x01 => AlertType::Warning,
+            0x02 => AlertType::Fatal,
+            _ => AlertType::Unknown(val),
+        }
+    }
+
+    fn decode_alert_desc(val: u8) -> AlertDescription {
+        match val {
+            0x28 => AlertDescription::HandshakeFailure,
+            0x2f => AlertDescription::IllegalParameter,
+            0x32 => AlertDescription::DecodeError,
+            0x33 => AlertDescription::DecryptError,
+            0x46 => AlertDescription::ProtocolVersion,
+            0x6d => AlertDescription::MissingExtension,
+            _ => AlertDescription::Unknown(val),
+        }
+    }
+
+    fn decode_handshake_msg(fragment: &[u8]) -> Result<HandshakeMsg, Error> {
+        // TODO
+        println!("received server hello: {:?}", fragment);
+        Ok(HandshakeMsg::ServerHello)
+    }
+}
+
+#[derive(Debug)]
+enum Record {
+    Invalid,
+    ChangeCipherSpec,
+    Alert(AlertType, AlertDescription),
+    Handshake(HandshakeMsg),
+    ApplicationData,
+}
+
+#[derive(Debug)]
+enum HandshakeMsg {
+    ClientHello(CipherSuite, Vec<HandshakeExtension>),
+    ServerHello,
+    _NewSessionTicket,
+    _EncryptedExtensions,
+    _Certificate,
+    _CertificateVerify,
+    _Finished,
+    _KeyUpdated,
+}
+
+#[derive(Debug)]
+enum HandshakeExtension {
+    SupportedVersions(Vec<TlsVersion>),
+    SupportedGroups(Vec<KeyGroup>),
+    KeyShare(KeyGroup, Vec<u8>),
+    SignatureAlgorithms(Vec<SignatureAlgorithm>),
+    ServerName(String),
 }
 
 #[derive(Debug)]
@@ -370,24 +405,6 @@ enum AlertType {
     Warning,
     Fatal,
     Unknown(u8),
-}
-
-impl AlertType {
-    fn encode(&self) -> u8 {
-        match self {
-            Self::Warning => 0x01,
-            Self::Fatal => 0x02,
-            Self::Unknown(val) => *val,
-        }
-    }
-
-    fn decode(val: u8) -> Self {
-        match val {
-            0x01 => Self::Warning,
-            0x02 => Self::Fatal,
-            _ => Self::Unknown(val),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -399,30 +416,4 @@ enum AlertDescription {
     ProtocolVersion,
     MissingExtension,
     Unknown(u8),
-}
-
-impl AlertDescription {
-    fn encode(&self) -> u8 {
-        match self {
-            Self::HandshakeFailure => 0x28,
-            Self::IllegalParameter => 0x2f,
-            Self::DecodeError => 0x32,
-            Self::DecryptError => 0x33,
-            Self::ProtocolVersion => 0x46,
-            Self::MissingExtension => 0x6d,
-            Self::Unknown(val) => *val,
-        }
-    }
-
-    fn decode(val: u8) -> Self {
-        match val {
-            0x28 => Self::HandshakeFailure,
-            0x2f => Self::IllegalParameter,
-            0x32 => Self::DecodeError,
-            0x33 => Self::DecryptError,
-            0x46 => Self::ProtocolVersion,
-            0x6d => Self::MissingExtension,
-            _ => Self::Unknown(val),
-        }
-    }
 }
