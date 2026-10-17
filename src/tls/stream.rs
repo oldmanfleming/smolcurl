@@ -122,32 +122,18 @@ impl<'a> TlsWriter<'a> {
     }
 
     fn encode_fragment(&mut self, record: Record) -> Result<(), Error> {
-        // reserve len slots with saved positions
-        let len_pos = self.pos;
-        self.pos += 2;
-        let start_pos = self.pos;
-
-        match record {
-            Record::Handshake(msg) => self.encode_msg(msg)?,
-            Record::Alert(atype, adesc) => self.set_bytes(&[
-                Self::encode_alert_type(&atype),
-                Self::encode_alert_desc(&adesc),
-            ])?,
-            Record::ChangeCipherSpec => self.set_bytes(&[0x01, 0x01])?,
-            _ => todo!(),
-        };
-
-        let len: u16 = (self.pos - start_pos)
-            .try_into()
-            .context("fragment len is too large")?;
-        let len_bytes = len.to_be_bytes();
-        let slot = self
-            .buf
-            .get_mut(len_pos..len_pos + 2)
-            .context("unexpected end of buff")?;
-        slot.copy_from_slice(&len_bytes);
-
-        Ok(())
+        self.encode_dyn_len_data::<u16>(|writer| {
+            match record {
+                Record::Handshake(msg) => writer.encode_msg(msg),
+                Record::Alert(atype, adesc) => writer.set_bytes(&[
+                    Self::encode_alert_type(&atype),
+                    Self::encode_alert_desc(&adesc),
+                ]),
+                Record::ChangeCipherSpec => writer.set_bytes(&[0x01, 0x01]),
+                _ => todo!(),
+            }?;
+            Ok(None)
+        })
     }
 
     fn encode_alert_type(atype: &AlertType) -> u8 {
@@ -171,74 +157,47 @@ impl<'a> TlsWriter<'a> {
     }
 
     fn encode_msg(&mut self, msg: HandshakeMsg) -> Result<(), Error> {
-        // reserve header slots (type and len) with saved positions
-        let header_pos = self.pos;
-        self.pos += 4;
-        let start_pos = self.pos;
+        // NOTE: There is an implicit assumption here that what
+        // we encode in the match will never be more than 24 bytes,
+        // as the lead byte is used by the byte returned by the match
+        // as the header type
+        self.encode_dyn_len_data::<u32>(|writer| {
+            match msg {
+                HandshakeMsg::ClientHello(cipher_suite, extensions) => {
+                    writer.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
 
-        let htype: HandshakeType = match msg {
-            HandshakeMsg::ClientHello(cipher_suite, extensions) => {
-                self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
+                    let mut random = [0u8; 32];
+                    rand::fill(&mut random);
+                    writer.set_bytes(&random)?;
 
-                let mut random = [0u8; 32];
-                rand::fill(&mut random);
-                self.set_bytes(&random)?;
+                    // sending empty session id for simplicity
+                    // in future we can send random 32 octets
+                    // and validate echoed value from ServerHello
+                    let legacy_session_id = 0x00u8.to_be_bytes();
+                    writer.encode_data::<u8>(&legacy_session_id)?;
 
-                // sending empty session id for simplicity
-                // in future we can send random 32 octets
-                // and validate echoed value from ServerHello
-                let legacy_session_id = 0x00u8.to_be_bytes();
-                self.encode_data_u8(&legacy_session_id)?;
+                    writer.encode_data::<u16>(&cipher_suite.to_be_bytes())?;
 
-                self.encode_data_u16(&cipher_suite.to_be_bytes())?;
+                    // TLS1.3 does not allow compression
+                    writer.encode_data::<u8>(&COMPRESSION_DISABLED.to_be_bytes())?;
 
-                // TLS1.3 does not allow compression
-                self.encode_data_u8(&COMPRESSION_DISABLED.to_be_bytes())?;
+                    writer.encode_extensions(extensions)?;
 
-                self.encode_extensions(extensions)?;
-
-                CLIENT_HELLO
+                    Ok(Some(CLIENT_HELLO))
+                }
+                other => bail!("encoding {:?} is not supported.", other),
             }
-            other => bail!("encoding {:?} is not supported.", other),
-        };
-
-        // There is no native u24 type in rust, so parse as u32.
-        // We then replace the first byte with the handshake type since it's not used
-        let len: u32 = (self.pos - start_pos)
-            .try_into()
-            .context("msg len is too long")?;
-        let mut header = len.to_be_bytes();
-        header[0] = htype;
-        let slot = self
-            .buf
-            .get_mut(header_pos..header_pos + 4)
-            .context("unexpected end of buff")?;
-        slot.copy_from_slice(&header);
-        Ok(())
+        })
     }
 
     fn encode_extensions(&mut self, extensions: Vec<HandshakeExtension>) -> Result<(), Error> {
-        // reserve len slot with saved positions
-        let len_pos = self.pos;
-        self.pos += 2;
-        let start_pos = self.pos;
-
-        for ext in extensions {
-            self.set_bytes(&Self::encode_extension_type(&ext).to_be_bytes())?;
-            self.encode_extension_data(ext)?;
-        }
-
-        let len: u16 = (self.pos - start_pos)
-            .try_into()
-            .context("extensions len is too large")?;
-        let len_bytes = len.to_be_bytes();
-        let slot = self
-            .buf
-            .get_mut(len_pos..len_pos + 2)
-            .context("unexpected end of buff")?;
-        slot.copy_from_slice(&len_bytes);
-
-        Ok(())
+        self.encode_dyn_len_data::<u16>(|writer| {
+            for ext in extensions {
+                writer.set_bytes(&Self::encode_extension_type(&ext).to_be_bytes())?;
+                writer.encode_extension_data(ext)?;
+            }
+            Ok(None)
+        })
     }
 
     fn encode_extension_type(ext: &HandshakeExtension) -> u16 {
@@ -252,70 +211,82 @@ impl<'a> TlsWriter<'a> {
     }
 
     fn encode_extension_data(&mut self, ext: HandshakeExtension) -> Result<(), Error> {
+        self.encode_dyn_len_data::<u16>(|writer| {
+            match ext {
+                HandshakeExtension::SupportedVersions(versions) => writer
+                    .encode_dyn_len_data::<u8>(|w| {
+                        for v in versions {
+                            w.set_bytes(&v.to_be_bytes())?;
+                        }
+                        Ok(None)
+                    }),
+                HandshakeExtension::SupportedGroups(groups) => {
+                    writer.encode_dyn_len_data::<u16>(|w| {
+                        for g in groups {
+                            w.set_bytes(&g.to_be_bytes())?;
+                        }
+                        Ok(None)
+                    })
+                }
+                HandshakeExtension::KeyShare(group, pub_key) => {
+                    writer.encode_dyn_len_data::<u16>(|w| {
+                        w.set_bytes(&group.to_be_bytes())?;
+                        w.encode_data::<u16>(&pub_key)?;
+                        Ok(None)
+                    })
+                }
+                HandshakeExtension::SignatureAlgorithms(algs) => {
+                    writer.encode_dyn_len_data::<u16>(|w| {
+                        for a in algs {
+                            w.set_bytes(&a.to_be_bytes())?;
+                        }
+                        Ok(None)
+                    })
+                }
+                HandshakeExtension::ServerName(name) => writer.encode_dyn_len_data::<u16>(|w| {
+                    w.set_bytes(&[HOST_NAME])?;
+                    let len: u16 = name.len().try_into().context("hostname too long")?;
+                    w.set_bytes(&len.to_be_bytes())?;
+                    w.set_bytes(name.as_bytes())?;
+                    Ok(None)
+                }),
+            }?;
+            Ok(None)
+        })
+    }
+
+    fn encode_dyn_len_data<T: ByteLen>(
+        &mut self,
+        encode_data_fn: impl FnOnce(&mut TlsWriter) -> Result<Option<u8>, Error>,
+    ) -> Result<(), Error> {
         // reserve len slots with saved positions
         let len_pos = self.pos;
-        self.pos += 2;
+        self.pos += T::byte_len();
         let start_pos = self.pos;
 
-        let mut buf: Vec<u8> = vec![];
-        match ext {
-            HandshakeExtension::SupportedVersions(versions) => {
-                for v in versions {
-                    buf.write_all(&v.to_be_bytes())?;
-                }
-                self.encode_data_u8(&mut buf)?;
-            }
-            HandshakeExtension::SupportedGroups(groups) => {
-                for g in groups {
-                    buf.write_all(&g.to_be_bytes())?;
-                }
-                self.encode_data_u16(&mut buf)?;
-            }
-            HandshakeExtension::KeyShare(group, pub_key) => {
-                buf.write_all(&group.to_be_bytes())?;
-                let len: u16 = pub_key.len().try_into().context("pub key too long")?;
-                buf.write_all(&len.to_be_bytes())?;
-                buf.write_all(&pub_key)?;
-                self.encode_data_u16(&mut buf)?;
-            }
-            HandshakeExtension::SignatureAlgorithms(algs) => {
-                for a in algs {
-                    buf.write_all(&a.to_be_bytes())?;
-                }
-                self.encode_data_u16(&mut buf)?;
-            }
-            HandshakeExtension::ServerName(name) => {
-                buf.push(HOST_NAME);
-                let len: u16 = name.len().try_into().context("hostname too long")?;
-                buf.write_all(&len.to_be_bytes())?;
-                buf.write_all(name.as_bytes())?;
-                self.encode_data_u16(&mut buf)?;
-            }
-        };
+        // invoke closure that writes data
+        // optionally a lead byte can be returned (handshake msg frame is 1 octet type + 3 octet length)
+        let some_lead_byte = encode_data_fn(self)?;
 
-        let len: u16 = (self.pos - start_pos)
-            .try_into()
-            .context("extension data len is too large")?;
-        let len_bytes = len.to_be_bytes();
+        // measure written data len and update reserved len slots
+        let len: T = T::from_len(self.pos - start_pos)?;
+        let len_bytes = len.into_be_bytes();
         let slot = self
             .buf
-            .get_mut(len_pos..len_pos + 2)
+            .get_mut(len_pos..len_pos + T::byte_len())
             .context("unexpected end of buff")?;
-        slot.copy_from_slice(&len_bytes);
+        slot.copy_from_slice(len_bytes.as_ref());
+
+        if let Some(lead_byte) = some_lead_byte {
+            self.buf[len_pos] = lead_byte;
+        }
 
         Ok(())
     }
 
-    fn encode_data_u8(&mut self, data: &[u8]) -> Result<(), Error> {
-        let len: u8 = data.len().try_into()?;
-        self.set_bytes(&len.to_be_bytes())?;
-        self.set_bytes(data)?;
-        Ok(())
-    }
-
-    fn encode_data_u16(&mut self, data: &[u8]) -> Result<(), Error> {
-        let len: u16 = data.len().try_into()?;
-        self.set_bytes(&len.to_be_bytes())?;
+    fn encode_data<T: ByteLen>(&mut self, data: &[u8]) -> Result<(), Error> {
+        let len: T = T::from_len(data.len())?;
+        self.set_bytes(len.into_be_bytes().as_ref())?;
         self.set_bytes(data)?;
         Ok(())
     }
@@ -443,4 +414,56 @@ enum AlertDescription {
     ProtocolVersion,
     MissingExtension,
     Unknown(u8),
+}
+
+trait ByteLen: Sized {
+    type Bytes: AsRef<[u8]>;
+    fn from_len(n: usize) -> Result<Self, Error>;
+    fn into_be_bytes(self) -> Self::Bytes;
+    fn byte_len() -> usize;
+}
+
+impl ByteLen for u8 {
+    type Bytes = [u8; 1];
+    fn from_len(n: usize) -> Result<Self, Error> {
+        n.try_into().context("length too large for u8")
+    }
+
+    fn into_be_bytes(self) -> Self::Bytes {
+        self.to_be_bytes()
+    }
+
+    fn byte_len() -> usize {
+        1
+    }
+}
+
+impl ByteLen for u16 {
+    type Bytes = [u8; 2];
+    fn from_len(n: usize) -> Result<Self, Error> {
+        n.try_into().context("length too large for u16")
+    }
+
+    fn into_be_bytes(self) -> Self::Bytes {
+        self.to_be_bytes()
+    }
+
+    fn byte_len() -> usize {
+        2
+    }
+}
+
+impl ByteLen for u32 {
+    type Bytes = [u8; 4];
+    fn from_len(n: usize) -> Result<Self, Error> {
+        n.try_into().context("length too large for u32")
+    }
+
+    fn into_be_bytes(self) -> Self::Bytes {
+        self.to_be_bytes()
+    }
+
+    fn byte_len() -> usize {
+        4
+    }
 }
