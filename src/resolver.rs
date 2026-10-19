@@ -5,6 +5,8 @@ use std::{
 
 use anyhow::{Error, anyhow, bail};
 
+use crate::bytes::ByteLen;
+
 const MAX_DEPTH: u8 = 10;
 const MAX_DELEGATIONS: u8 = 10;
 const ROOT_NAME_SERVER: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4));
@@ -57,7 +59,7 @@ fn query(addr: IpAddr, name: &str, kind: RecordKind) -> Result<DnsPacket, Error>
     let (n, src) = socket.recv_from(&mut buf)?;
 
     if src != dest {
-        return Err(anyhow!("received unexpected response from: {src}"));
+        return Err(anyhow!("received unexpected response from: {src} {dest}"));
     }
 
     let packet = DnsReader::new(&buf[..n]).decode_packet()?;
@@ -165,12 +167,12 @@ impl<'a> DnsReader<'a> {
 
     fn decode_header(&mut self) -> Result<DnsHeader, Error> {
         Ok(DnsHeader {
-            id: self.decode_u16()?,
-            flags: self.decode_u16()?,
-            num_questions: self.decode_u16()?,
-            num_answers: self.decode_u16()?,
-            num_authorities: self.decode_u16()?,
-            num_additionals: self.decode_u16()?,
+            id: self.decode_value::<u16>()?,
+            flags: self.decode_value::<u16>()?,
+            num_questions: self.decode_value::<u16>()?,
+            num_answers: self.decode_value::<u16>()?,
+            num_authorities: self.decode_value::<u16>()?,
+            num_additionals: self.decode_value::<u16>()?,
         })
     }
 
@@ -181,8 +183,8 @@ impl<'a> DnsReader<'a> {
     fn decode_question(&mut self) -> Result<DnsQuestion, Error> {
         Ok(DnsQuestion {
             name: self.decode_name()?,
-            kind: RecordKind::decode(self.decode_u16()?),
-            class: RecordClass::decode(self.decode_u16()?),
+            kind: RecordKind::decode(self.decode_value::<u16>()?),
+            class: RecordClass::decode(self.decode_value::<u16>()?),
         })
     }
 
@@ -192,9 +194,9 @@ impl<'a> DnsReader<'a> {
 
     fn decode_record(&mut self) -> Result<DnsRecord, Error> {
         let name = self.decode_name()?;
-        let kind = RecordKind::decode(self.decode_u16()?);
-        let class = RecordClass::decode(self.decode_u16()?);
-        let ttl = self.decode_u32()?;
+        let kind = RecordKind::decode(self.decode_value::<u16>()?);
+        let class = RecordClass::decode(self.decode_value::<u16>()?);
+        let ttl = self.decode_value::<u32>()?;
         let data = self.decode_data(kind)?;
 
         Ok(DnsRecord {
@@ -209,7 +211,7 @@ impl<'a> DnsReader<'a> {
         let mut labels: Vec<String> = Vec::new();
 
         loop {
-            let len = self.decode_u8()?;
+            let len = self.decode_value::<u8>()?;
             match len & 0xC0 {
                 0x00 => {
                     if len == 0 {
@@ -219,7 +221,7 @@ impl<'a> DnsReader<'a> {
                 }
                 // Last two bits of the length being 1s indicate a compression pointer
                 0xC0 => {
-                    let rest = self.decode_u8()?;
+                    let rest = self.decode_value::<u8>()?;
                     // chop off the two leading bits and add it to the
                     // next 8 bits to form the pointer.
                     let pointer = (((len & 0x3F) as u16) << 8) | (rest as u16);
@@ -240,7 +242,7 @@ impl<'a> DnsReader<'a> {
     }
 
     fn decode_data(&mut self, kind: RecordKind) -> Result<RecordData, Error> {
-        let len: usize = self.decode_u16()?.into();
+        let len: usize = self.decode_value::<u16>()?.into();
         match kind {
             RecordKind::A => {
                 if len != 4 {
@@ -263,21 +265,8 @@ impl<'a> DnsReader<'a> {
         }
     }
 
-    fn decode_u8(&mut self) -> Result<u8, Error> {
-        let val = self
-            .data
-            .get(self.pos)
-            .ok_or_else(|| anyhow!("unexpected end of data"))?;
-        self.pos += 1;
-        Ok(*val)
-    }
-
-    fn decode_u16(&mut self) -> Result<u16, Error> {
-        Ok(u16::from_be_bytes(self.get_bytes(2)?.try_into()?))
-    }
-
-    fn decode_u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_be_bytes(self.get_bytes(4)?.try_into()?))
+    fn decode_value<T: ByteLen>(&mut self) -> Result<T, Error> {
+        Ok(T::from_be_bytes(self.get_bytes(T::byte_len())?)?)
     }
 
     fn get_bytes(&mut self, len: usize) -> Result<&'a [u8], Error> {
