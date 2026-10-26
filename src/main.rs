@@ -1,4 +1,5 @@
 mod bytes;
+mod crypto;
 mod http;
 mod resolver;
 mod tls;
