@@ -15,7 +15,7 @@ const ROUND_CONSTANTS: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-struct Sha256 {
+pub(crate) struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
     buffer_len: usize,
@@ -23,7 +23,7 @@ struct Sha256 {
 }
 
 impl Sha256 {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: INITIAL_HASH_VALUE,
             buffer: [0; 64],
@@ -32,7 +32,14 @@ impl Sha256 {
         }
     }
 
-    fn update(&mut self, mut data: &[u8]) {
+    pub(crate) fn hash(data: &[u8]) -> [u8; 32] {
+        let mut s = Self::new();
+        s.update(data);
+        s.finalize()
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let mut data = data;
         self.total_len += data.len() as u64;
 
         // keep anything left over in the buffer from a previous update call
@@ -62,7 +69,7 @@ impl Sha256 {
         self.buffer_len = data.len();
     }
 
-    fn finalize(&self) -> [u8; 32] {
+    pub(crate) fn finalize(&self) -> [u8; 32] {
         let mut state = self.state.clone();
         let mut data = self.buffer.clone();
         let mut pos = self.buffer_len;
