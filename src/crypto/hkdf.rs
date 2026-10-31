@@ -5,8 +5,8 @@ use crate::crypto::hmac::hmac_sha256;
 
 const HASH_LEN: usize = 32;
 
-fn extract(salt: &[u8], ikm: &[u8]) -> [u8; HASH_LEN] {
-    hmac_sha256(salt, ikm)
+fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; HASH_LEN] {
+    hmac_sha256(salt.unwrap_or(&[0u8; 32]), ikm)
 }
 
 fn expand(prk: &[u8], info: &[u8], l: usize) -> Result<Vec<u8>, Error> {
@@ -39,7 +39,7 @@ mod tests {
         let salt = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
         ];
-        let prk = extract(&salt, &ikm);
+        let prk = extract(Some(&salt), &ikm);
         assert_eq!(
             prk,
             [
@@ -78,7 +78,7 @@ mod tests {
             0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
             0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
         ];
-        let prk = extract(&salt, &ikm);
+        let prk = extract(Some(&salt), &ikm);
         assert_eq!(
             prk,
             [
