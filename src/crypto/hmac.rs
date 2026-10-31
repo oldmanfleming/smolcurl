@@ -1,10 +1,11 @@
+/// Reference: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.198-1.pdf
 use crate::crypto::sha256::Sha256;
 
 const B: usize = 64;
 const I: u8 = 0x36;
 const O: u8 = 0x5c;
 
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut k_prime = [0u8; B];
     let mut i_pad = [I; B];
     let mut o_pad = [O; B];
