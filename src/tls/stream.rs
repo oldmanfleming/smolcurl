@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Error, anyhow, bail};
 
-use crate::bytes::ByteLen;
+use crate::{
+    bytes::{ByteLen, U24},
+    crypto::{self, aead, hkdf, hmac, sha256::Sha256, x25519},
+};
 
 type TlsVersion = u16;
 type CipherSuite = u16;
@@ -14,6 +17,7 @@ type SignatureAlgorithm = u16;
 type ServerNameType = u8;
 type HandshakeType = u8;
 type ExtensionType = u16;
+type Signature = Vec<u8>;
 
 const LEGACY_RECORD_VERSION: TlsVersion = 0x0303;
 const TLS1_3: TlsVersion = 0x0304;
@@ -22,8 +26,12 @@ const ECDSA_SECP256R1_SHA256: SignatureAlgorithm = 0x0403;
 const X25519: KeyGroup = 0x001d;
 const HOST_NAME: ServerNameType = 0x00;
 
-const CLIENT_HELLO_MSG: HandshakeType = 0x01;
-const SERVER_HELLO_MSG: HandshakeType = 0x02;
+const CLIENT_HELLO_MSG: HandshakeType = 1;
+const SERVER_HELLO_MSG: HandshakeType = 2;
+const ENCRYPTED_EXTENSIONS_MSG: HandshakeType = 8;
+const CERTIFICATE_MSG: HandshakeType = 11;
+const CERTIFICATE_VERIFY_MSG: HandshakeType = 15;
+const FINISHED_MSG: HandshakeType = 20;
 
 const SUPPORTED_VERSIONS_EXT: ExtensionType = 0x002b;
 const KEY_SHARE_EXT: ExtensionType = 0x0033;
@@ -36,101 +44,221 @@ const HELLO_RETRY_REQUEST: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
-
-pub fn handshake(mut stream: TcpStream, hostname: &str) -> Result<TlsStream, Error> {
-    let mut buf = [0u8; MAX_RECORD_SIZE];
-
-    // TODO ---
-    let mut client_pub_key = [0u8; 32];
-    rand::fill(&mut client_pub_key);
-    // ---
-
-    let mut exts = vec![
-        HandshakeExtension::SupportedVersions(vec![TLS1_3]),
-        HandshakeExtension::SupportedGroups(vec![X25519]),
-        HandshakeExtension::KeyShare(X25519, client_pub_key),
-        HandshakeExtension::SignatureAlgorithms(vec![ECDSA_SECP256R1_SHA256]),
-    ];
-
-    // don't pass server name if we have a user supplied ip address
-    if hostname.parse::<IpAddr>().is_err() {
-        exts.push(HandshakeExtension::ServerName(hostname.to_string()));
-    }
-    let hello = HandshakeMsg::ClientHello(TLS_CHACHA20_POLY1305_SHA256, exts);
-    let req = Record::Handshake(hello);
-
-    println!("sending handshake req: {:?}", req);
-
-    stream.write_all(TlsWriter::new(&mut buf).encode(req)?)?;
-
-    for _ in 0..MAX_HANDSHAKE_RESPONSE_RECORDS {
-        stream.read_exact(&mut buf[0..5])?;
-        let ctype = *buf.get(0).context("missing content type in response")?;
-        let len = u16::from_be_bytes(buf[3..5].try_into()?);
-        stream.read_exact(&mut buf[..usize::from(len)])?;
-
-        let resp = TlsReader::new(&buf).decode(ctype)?;
-
-        match resp {
-            Record::Alert(atype, adesc) => bail!("unexpected alert: {:?} {:?}", atype, adesc),
-            Record::Handshake(msg) => match msg {
-                HandshakeMsg::ServerHello(server_pub_key) => {
-                    println!("received server hello with pub key: {:?}", server_pub_key);
-                    return Ok(TlsStream {
-                        inner: stream,
-                        _client_pub_key: client_pub_key,
-                        _server_pub_key: server_pub_key,
-                    });
-                }
-                _ => todo!(),
-            },
-            Record::ChangeCipherSpec => {
-                println!("received change cipher spec resp");
-            }
-            other => println!("unexpected record type during handshake: {:?}", other),
-        }
-    }
-
-    Err(anyhow!("did not receive handshake response"))
-}
+const CLIENT_HS_TRAFFIC_LABEL: &'static [u8] = b"c hs traffic";
+const SERVER_HS_TRAFFIC_LABEL: &'static [u8] = b"s hs traffic";
+const CLIENT_AP_TRAFFIC_LABEL: &'static [u8] = b"c ap traffic";
+const SERVER_AP_TRAFFIC_LABEL: &'static [u8] = b"s ap traffic";
 
 pub struct TlsStream {
     inner: TcpStream,
-    _client_pub_key: [u8; 32],
-    _server_pub_key: [u8; 32],
-}
-
-impl Read for TlsStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-
-impl Write for TlsStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-struct TlsWriter<'a> {
-    buf: &'a mut [u8],
+    buf: [u8; MAX_RECORD_SIZE],
     pos: usize,
+    len: usize,
+    hasher: Sha256,
+    handshake_secret: [u8; 32],
+    master_secret: [u8; 32],
+    client_traffic_secret: TrafficSecret,
+    server_traffic_secert: TrafficSecret,
 }
 
-impl<'a> TlsWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, pos: 0 }
+impl TlsStream {
+    pub(crate) fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            buf: [0u8; MAX_RECORD_SIZE],
+            pos: 0,
+            len: 0,
+            hasher: Sha256::new(),
+            handshake_secret: [0u8; 32],
+            master_secret: [0u8; 32],
+            client_traffic_secret: TrafficSecret {
+                secret: vec![],
+                key: vec![],
+                iv: vec![],
+                seq_number: 0,
+            },
+            server_traffic_secert: TrafficSecret {
+                secret: vec![],
+                key: vec![],
+                iv: vec![],
+                seq_number: 0,
+            },
+        }
     }
 
-    fn encode(mut self, record: Record) -> Result<&'a [u8], Error> {
+    pub(crate) fn handshake(&mut self, hostname: &str) -> Result<(), Error> {
+        let mut client_priv_key = [0u8; 32];
+        rand::fill(&mut client_priv_key);
+        let mut u = [0u8; 32];
+        u[0..4].copy_from_slice(&9u32.to_le_bytes());
+        let client_pub_key = x25519::x25519(client_priv_key, u);
+
+        let mut exts = vec![
+            HandshakeExtension::SupportedVersions(vec![TLS1_3]),
+            HandshakeExtension::SupportedGroups(vec![X25519]),
+            HandshakeExtension::KeyShare(X25519, client_pub_key),
+            HandshakeExtension::SignatureAlgorithms(vec![ECDSA_SECP256R1_SHA256]),
+        ];
+
+        // don't pass server name if we have a user supplied ip address
+        if hostname.parse::<IpAddr>().is_err() {
+            exts.push(HandshakeExtension::ServerName(hostname.to_string()));
+        }
+        let hello = HandshakeMsg::ClientHello(TLS_CHACHA20_POLY1305_SHA256, exts);
+        let req = Record::Handshake(hello);
+
+        println!("sending client hello: {:?}", req);
+        self.write_record(req)?;
+
+        // update the transcript hash with client hello
+        // skip the record framing when hashing the transcript
+        self.hasher.update(&self.buf[5..self.pos]);
+
+        match self.recv_handshake_msg()? {
+            HandshakeMsg::ServerHello(server_pub_key) => {
+                println!("received server hello with pub key: {:?}", server_pub_key);
+
+                // update the transcript hash with server hello
+                // buffer is already the inner msg part only
+                self.hasher.update(&self.buf[..self.pos]);
+                let transcript_hash = self.hasher.finalize();
+
+                let early_secret = hkdf::extract(Some(&[0u8; 32]), &[0u8; 32]);
+                let ecdhe = x25519::x25519(client_priv_key, server_pub_key);
+
+                let (handshake_secret, client_hs_traffic_secret, server_hs_traffic_secret) =
+                    Self::extract_secrets(
+                        &early_secret,
+                        &ecdhe,
+                        CLIENT_HS_TRAFFIC_LABEL,
+                        SERVER_HS_TRAFFIC_LABEL,
+                        transcript_hash,
+                    )?;
+                self.handshake_secret = handshake_secret;
+                self.client_traffic_secret = client_hs_traffic_secret;
+                self.server_traffic_secert = server_hs_traffic_secret;
+            }
+            r => bail!(
+                "received unexpected record when expecting server hello: {:?}",
+                r
+            ),
+        };
+
+        match self.recv_handshake_msg()? {
+            HandshakeMsg::EncryptedExtensions(exts) => {
+                println!("received encrypted extensions message: {:?}", exts);
+                self.hasher.update(&self.buf[..self.pos]);
+            }
+            r => bail!(
+                "received unexpected record when expecting encrypted extensions: {:?}",
+                r
+            ),
+        }
+
+        match self.recv_handshake_msg()? {
+            HandshakeMsg::Certificate(certificate_entries) => {
+                println!(
+                    "received certificate message with entries: {:?}",
+                    certificate_entries
+                );
+
+                self.hasher.update(&self.buf[..self.pos]);
+
+                match self.recv_handshake_msg()? {
+                    HandshakeMsg::CertificateVerify(signature) => {
+                        println!(
+                            "received certificate verify message with signature: {:?}",
+                            signature
+                        );
+
+                        let transcript_hash = self.hasher.finalize();
+
+                        // TODO: verify certificate
+
+                        self.hasher.update(&self.buf[..self.pos]);
+                    }
+                    r => bail!(
+                        "received unexpected record when expecting certificate verify: {:?}",
+                        r
+                    ),
+                }
+            }
+            r => bail!(
+                "received unexpected record when expecting certificate: {:?}",
+                r
+            ),
+        }
+
+        match self.recv_handshake_msg()? {
+            HandshakeMsg::Finished(server_verify_data) => {
+                println!(
+                    "received finished message with verification data: {:?}",
+                    server_verify_data
+                );
+
+                let transcript_hash = self.hasher.finalize();
+                let finished_key = crypto::hkdf_expand_label(
+                    &self.server_traffic_secert.secret,
+                    b"finished",
+                    b"",
+                    32,
+                )?;
+                let client_verify_data = hmac::hmac_sha256(&finished_key, &transcript_hash);
+
+                // validation must be a constant time comparison
+                let mut valid = true;
+                for i in 0..32 {
+                    if server_verify_data[i] != client_verify_data[i] {
+                        valid = false;
+                    }
+                }
+                if !valid {
+                    bail!(
+                        "server and client do not agree on verification data: {:?} {:?}",
+                        server_verify_data,
+                        client_verify_data
+                    )
+                }
+
+                self.hasher.update(&self.buf[..self.pos]);
+            }
+            r => bail!(
+                "received unexpected record when expecting finished: {:?}",
+                r
+            ),
+        }
+
+        let transcript_hash = self.hasher.finalize();
+        let (master_secret, client_ap_traffic_secret, server_ap_traffic_secret) =
+            Self::extract_secrets(
+                &self.handshake_secret,
+                &[0u8; 32],
+                CLIENT_AP_TRAFFIC_LABEL,
+                SERVER_AP_TRAFFIC_LABEL,
+                transcript_hash,
+            )?;
+        self.master_secret = master_secret;
+        self.client_traffic_secret = client_ap_traffic_secret;
+        self.server_traffic_secert = server_ap_traffic_secret;
+
+        let finished_key =
+            crypto::hkdf_expand_label(&self.client_traffic_secret.secret, b"finished", b"", 32)?;
+        let verify_data = hmac::hmac_sha256(&finished_key, &transcript_hash);
+
+        let finished = HandshakeMsg::Finished(verify_data);
+        self.write_record(Record::Handshake(finished))?;
+
+        Ok(())
+    }
+
+    fn write_record(&mut self, record: Record) -> Result<(), Error> {
+        self.pos = 0;
         self.set_bytes(&[Self::encode_content_type(&record)])?;
         self.set_bytes(&LEGACY_RECORD_VERSION.to_be_bytes())?;
         self.encode_fragment(record)?;
-        Ok(&self.buf[0..self.pos])
+        let stream = &mut self.inner;
+        stream.write_all(&self.buf[0..self.pos])?;
+        Ok(())
     }
 
     fn encode_content_type(record: &Record) -> u8 {
@@ -278,7 +406,7 @@ impl<'a> TlsWriter<'a> {
 
     fn encode_dyn_len_data<T: ByteLen>(
         &mut self,
-        encode_data_fn: impl FnOnce(&mut TlsWriter) -> Result<Option<u8>, Error>,
+        encode_data_fn: impl FnOnce(&mut TlsStream) -> Result<Option<u8>, Error>,
     ) -> Result<(), Error> {
         // reserve len slots with saved positions
         let len_pos = self.pos;
@@ -321,44 +449,88 @@ impl<'a> TlsWriter<'a> {
         self.pos += data.len();
         Ok(())
     }
-}
 
-struct TlsReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
+    fn recv_handshake_msg(&mut self) -> Result<HandshakeMsg, Error> {
+        // Receive a record while handling potential alert and change cipher messages
+        for _ in 0..MAX_HANDSHAKE_RESPONSE_RECORDS {
+            let record = self.read_record()?;
 
-impl<'a> TlsReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+            match record {
+                Record::Alert(atype, adesc) => bail!("unexpected alert: {:?} {:?}", atype, adesc),
+                Record::ChangeCipherSpec => {
+                    println!("received change cipher spec");
+                }
+                Record::Handshake(msg) => return Ok(msg),
+                other => println!("unexpected record type during handshake: {:?}", other),
+            }
+        }
+        Err(anyhow!("didn't receive handshake message"))
     }
 
-    fn decode(&mut self, ctype: u8) -> Result<Record, Error> {
+    fn read_record(&mut self) -> Result<Record, Error> {
+        self.inner.read_exact(&mut self.buf[0..5])?;
+        let ctype = *self
+            .buf
+            .get(0)
+            .context("missing content type in response")?;
+        let len = u16::from_be_bytes(self.buf[3..5].try_into()?);
+        self.inner.read_exact(&mut self.buf[..usize::from(len)])?;
+        self.pos = 0;
+        self.len = len.into();
+        self.decode_record(ctype, &len.to_be_bytes())
+    }
+
+    fn decode_record(&mut self, ctype: u8, len: &[u8; 2]) -> Result<Record, Error> {
         let res = match ctype {
             0x00 => Record::Invalid,
             0x14 => {
-                let [0x01, 0x01] = self.buf else {
-                    bail!("unexpected change cipher spec format")
+                if self.buf[0] != 0x01 {
+                    bail!("unexpected change cipher spec format: {}", self.buf[0])
                 };
                 Record::ChangeCipherSpec
             }
             0x15 => {
-                let [atype, adesc, ..] = self.buf else {
-                    bail!("alert response too short");
-                };
+                let [atype, adesc, ..] = self.buf;
                 Record::Alert(
-                    Self::decode_alert_type(*atype),
-                    Self::decode_alert_desc(*adesc),
+                    Self::decode_alert_type(atype),
+                    Self::decode_alert_desc(adesc),
                 )
             }
             0x16 => {
                 let msg = self.decode_handshake_msg()?;
                 Record::Handshake(msg)
             }
-            0x17 => Record::ApplicationData,
+            0x17 => {
+                self.decrypt_data(ctype, len)?;
+                let msg = self.decode_handshake_msg()?;
+                Record::Handshake(msg)
+            }
             other => bail!("unexpected response content type: {}", other),
         };
         Ok(res)
+    }
+
+    fn decrypt_data(&mut self, ctype: u8, len: &[u8; 2]) -> Result<(), Error> {
+        let key: &[u8; 32] = &self.server_traffic_secert.key.as_slice().try_into()?;
+        let seq_number = self.server_traffic_secert.seq_number.to_be_bytes();
+        let iv = &self.server_traffic_secert.iv;
+        let mut nonce = [0u8; 12];
+        for i in 0..12 {
+            if i < 4 {
+                nonce[i] = 0x0 ^ iv[i];
+            } else {
+                nonce[i] = seq_number[i - 4] ^ iv[i];
+            }
+        }
+        let aad = [ctype, 0x03, 0x03, len[0], len[1]];
+        let encrypted_record = &self.buf[0..self.len];
+        let split = encrypted_record.len() - 16;
+        let ciphertext = &encrypted_record[..split];
+        let tag: &[u8; 16] = &encrypted_record[split..].try_into()?;
+        let decrypted_record = aead::chacha20_aead_decrypt(&key, &nonce, &aad, ciphertext, tag)?;
+        self.server_traffic_secert.seq_number += 1;
+        self.buf[0..decrypted_record.len()].copy_from_slice(&decrypted_record);
+        Ok(())
     }
 
     fn decode_alert_type(val: u8) -> AlertType {
@@ -384,9 +556,9 @@ impl<'a> TlsReader<'a> {
     fn decode_handshake_msg(&mut self) -> Result<HandshakeMsg, Error> {
         // msg header is 1 byte type + 3 byte length
         // we parse the type in-place and then mask it out of the 32bit parsed length
-        let msg_type = self.buf.get(self.pos).context("missing msg type")?;
-        let _len = self.decode_data::<u32>()? & 0x00FFFFFF; // do we need to use len?
-        match *msg_type {
+        let msg_type = self.decode_data::<u8>()?;
+        let len = self.decode_data::<U24>()?.0;
+        match msg_type {
             SERVER_HELLO_MSG => {
                 // legacy version is ignored, but still needs to be read
                 self.decode_data::<u16>()?;
@@ -456,6 +628,52 @@ impl<'a> TlsReader<'a> {
                     None => bail!("did not receive key share from server"),
                 }
             }
+            ENCRYPTED_EXTENSIONS_MSG => {
+                let ext_len = self.decode_data::<u16>()?;
+                let mut extensions: Vec<HandshakeExtension> = vec![];
+                for _ in 0..ext_len {
+                    let ext = self.decode_data::<u8>()?;
+                    extensions.push(Self::decode_handshake_extension(ext))
+                }
+                Ok(HandshakeMsg::EncryptedExtensions(extensions))
+            }
+            CERTIFICATE_MSG => {
+                let _certificate_request_context = self.decode_data::<u8>()?;
+                let certificate_list_len = self.decode_data::<U24>()?.0 as usize;
+                let mut certificate_entries: Vec<CertificateEntry> = vec![];
+                let mut pos = 0;
+                while pos < certificate_list_len {
+                    let cert_data_len = self.decode_data::<U24>()?.0 as usize;
+                    let cert_data = self.get_bytes(cert_data_len)?.to_vec();
+                    let extensions_len = self.decode_data::<u16>()? as usize;
+                    let extensions = self.get_bytes(extensions_len)?.to_vec();
+                    certificate_entries.push(CertificateEntry {
+                        data: cert_data,
+                        extensions: extensions,
+                    });
+                    pos += 3 + cert_data_len + 2 + extensions_len;
+                }
+                Ok(HandshakeMsg::Certificate(certificate_entries))
+            }
+            CERTIFICATE_VERIFY_MSG => {
+                let algorithm = self.decode_data::<u16>()?;
+                if algorithm != ECDSA_SECP256R1_SHA256 {
+                    bail!("unexpected signature algorithm: {}", algorithm)
+                }
+                let signature_len = self.decode_data::<u16>()?;
+                let signature = self.get_bytes(signature_len as usize)?.to_vec();
+                Ok(HandshakeMsg::CertificateVerify(signature))
+            }
+            FINISHED_MSG => {
+                let verify_data: [u8; 32] = self.get_bytes(len as usize)?.try_into()?;
+                Ok(HandshakeMsg::Finished(verify_data))
+            }
+            m => bail!("received unsupported handshake message response: {}", m),
+        }
+    }
+
+    fn decode_handshake_extension(ext: u8) -> HandshakeExtension {
+        match ext {
             _ => todo!(),
         }
     }
@@ -464,7 +682,7 @@ impl<'a> TlsReader<'a> {
         Ok(T::from_be_bytes(self.get_bytes(T::byte_len())?)?)
     }
 
-    fn get_bytes(&mut self, len: usize) -> Result<&'a [u8], Error> {
+    fn get_bytes(&mut self, len: usize) -> Result<&[u8], Error> {
         let bytes = self
             .buf
             .get(self.pos..self.pos + len)
@@ -472,6 +690,71 @@ impl<'a> TlsReader<'a> {
         self.pos += len;
         Ok(bytes)
     }
+
+    fn extract_secrets(
+        secret: &[u8],
+        ikm: &[u8],
+        client_label: &[u8],
+        server_label: &[u8],
+        transcript_hash: [u8; 32],
+    ) -> Result<([u8; 32], TrafficSecret, TrafficSecret), Error> {
+        let derived_early = Self::derive_secret(secret, b"derived", Sha256::hash(b""))?;
+        let hs_secret = hkdf::extract(Some(&derived_early), ikm);
+        let client_secret = Self::derive_secret(&hs_secret, client_label, transcript_hash)?;
+        let server_secret = Self::derive_secret(&hs_secret, server_label, transcript_hash)?;
+        let client_traffic_secret = TrafficSecret::new(client_secret)?;
+        let server_traffic_secret = TrafficSecret::new(server_secret)?;
+        Ok((hs_secret, client_traffic_secret, server_traffic_secret))
+    }
+
+    fn derive_secret(
+        secret: &[u8],
+        label: &[u8],
+        transcript_hash: [u8; 32],
+    ) -> Result<Vec<u8>, Error> {
+        crypto::hkdf_expand_label(secret, label, &transcript_hash, transcript_hash.len())
+    }
+}
+
+impl Read for TlsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        todo!()
+    }
+}
+
+impl Write for TlsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        todo!()
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+struct TrafficSecret {
+    secret: Vec<u8>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    seq_number: u64,
+}
+
+impl TrafficSecret {
+    pub fn new(secret: Vec<u8>) -> Result<Self, Error> {
+        Ok(Self {
+            secret: secret.clone(),
+            key: crypto::hkdf_expand_label(&secret, b"key", b"", 32)?,
+            iv: crypto::hkdf_expand_label(&secret, b"iv", b"", 12)?,
+            seq_number: 0,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CertificateEntry {
+    data: Vec<u8>,
+    extensions: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -488,10 +771,10 @@ enum HandshakeMsg {
     ClientHello(CipherSuite, Vec<HandshakeExtension>),
     ServerHello([u8; 32]),
     _NewSessionTicket,
-    _EncryptedExtensions,
-    _Certificate,
-    _CertificateVerify,
-    _Finished,
+    EncryptedExtensions(Vec<HandshakeExtension>),
+    Certificate(Vec<CertificateEntry>),
+    CertificateVerify(Signature),
+    Finished([u8; 32]),
     _KeyUpdated,
 }
 

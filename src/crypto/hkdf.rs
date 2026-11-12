@@ -5,11 +5,11 @@ use crate::crypto::hmac::hmac_sha256;
 
 const HASH_LEN: usize = 32;
 
-fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; HASH_LEN] {
+pub(crate) fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; HASH_LEN] {
     hmac_sha256(salt.unwrap_or(&[0u8; 32]), ikm)
 }
 
-fn expand(prk: &[u8], info: &[u8], l: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn expand(prk: &[u8], info: &[u8], l: usize) -> Result<Vec<u8>, Error> {
     if l > 255 * HASH_LEN {
         bail!("requested output too large for hkdf expand")
     }

@@ -1,4 +1,6 @@
-use anyhow::{Context, Error};
+use anyhow::{Context, Error, bail};
+
+pub(crate) struct U24(pub u32);
 
 // Trait for providing common functions for converting to/from fixed size byte slices
 pub(crate) trait ByteLen: Sized {
@@ -63,5 +65,28 @@ impl ByteLen for u32 {
 
     fn byte_len() -> usize {
         4
+    }
+}
+
+impl ByteLen for U24 {
+    type Bytes = [u8; 3];
+    fn from_len(n: usize) -> Result<Self, Error> {
+        if n > 0xFFFFFF {
+            bail!("length too large for u24: {}", n);
+        }
+        Ok(U24(n as u32))
+    }
+
+    fn into_be_bytes(self) -> Self::Bytes {
+        let bytes = self.0.to_be_bytes();
+        [bytes[1], bytes[2], bytes[3]]
+    }
+
+    fn from_be_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(U24(u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]])))
+    }
+
+    fn byte_len() -> usize {
+        3
     }
 }

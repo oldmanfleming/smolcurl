@@ -8,7 +8,7 @@ use anyhow::{Error, anyhow};
 
 use crate::{
     resolver::{RecordKind, resolve},
-    tls::stream::{TlsStream, handshake},
+    tls::stream::TlsStream,
     url::{Scheme, URL},
 };
 
@@ -27,7 +27,11 @@ pub fn connect(url: &URL) -> Result<impl Read + Write + use<>, Error> {
 
     match url.scheme {
         Scheme::Http => Ok(Transport::Plain(stream)),
-        Scheme::Https => Ok(Transport::Tls(handshake(stream, &url.host)?)),
+        Scheme::Https => {
+            let mut stream = TlsStream::new(stream);
+            stream.handshake(&url.host)?;
+            Ok(Transport::Tls(stream))
+        }
     }
 }
 

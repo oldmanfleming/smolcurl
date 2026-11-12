@@ -262,7 +262,7 @@ fn multiply_mod_p_limbs(a: [u32; 5], r: [u32; 5]) -> [u32; 5] {
 // The idea: a coming out of the loop is guaranteed < 2p, not necessarily < p.
 // So we compute a - p with borrow propagation, and only keep that result if the subtraction didn't need to "borrow past the top"
 // I.e., only if a >= p. Otherwise a was already the answer.
-fn fully_reduce(mut a: [u32; 5]) -> [u32; 5] {
+fn fully_reduce(a: [u32; 5]) -> [u32; 5] {
     let p: [u32; 5] = [
         (1 << 26) - 5,
         (1 << 26) - 1,
