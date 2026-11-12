@@ -110,10 +110,6 @@ impl TlsStream {
         println!("sending client hello: {:?}", req);
         self.write_record(req)?;
 
-        // update the transcript hash with client hello
-        // skip the record framing when hashing the transcript
-        self.hasher.update(&self.buf[5..self.pos]);
-
         match self.recv_handshake_msg()? {
             HandshakeMsg::ServerHello(server_pub_key) => {
                 println!("received server hello with pub key: {:?}", server_pub_key);
@@ -189,6 +185,7 @@ impl TlsStream {
             ),
         }
 
+        // receive and verify server finished message
         match self.recv_handshake_msg()? {
             HandshakeMsg::Finished(server_verify_data) => {
                 println!(
@@ -228,6 +225,7 @@ impl TlsStream {
             ),
         }
 
+        // construct application secrets and send client finished message
         let transcript_hash = self.hasher.finalize();
         let (master_secret, client_ap_traffic_secret, server_ap_traffic_secret) =
             Self::extract_secrets(
@@ -237,16 +235,17 @@ impl TlsStream {
                 SERVER_AP_TRAFFIC_LABEL,
                 transcript_hash,
             )?;
-        self.master_secret = master_secret;
-        self.client_traffic_secret = client_ap_traffic_secret;
-        self.server_traffic_secert = server_ap_traffic_secret;
 
         let finished_key =
             crypto::hkdf_expand_label(&self.client_traffic_secret.secret, b"finished", b"", 32)?;
         let verify_data = hmac::hmac_sha256(&finished_key, &transcript_hash);
 
         let finished = HandshakeMsg::Finished(verify_data);
-        self.write_record(Record::Handshake(finished))?;
+        self.write_record(Record::ApplicationFinished(finished))?;
+
+        self.master_secret = master_secret;
+        self.client_traffic_secret = client_ap_traffic_secret;
+        self.server_traffic_secert = server_ap_traffic_secret;
 
         Ok(())
     }
@@ -267,43 +266,60 @@ impl TlsStream {
             Record::ChangeCipherSpec => 0x14,
             Record::Alert(..) => 0x15,
             Record::Handshake(..) => 0x16,
-            Record::ApplicationData => 0x17,
+            Record::ApplicationData(..) => 0x17,
+            Record::ApplicationFinished(..) => 0x17,
         }
     }
 
     fn encode_fragment(&mut self, record: Record) -> Result<(), Error> {
         self.encode_dyn_len_data::<u16>(|writer| {
             match record {
-                Record::Handshake(msg) => writer.encode_msg(msg),
-                Record::Alert(atype, adesc) => writer.set_bytes(&[
-                    Self::encode_alert_type(&atype),
-                    Self::encode_alert_desc(&adesc),
-                ]),
-                Record::ChangeCipherSpec => writer.set_bytes(&[0x01, 0x01]),
+                Record::Handshake(msg) => {
+                    let start = writer.pos;
+                    writer.encode_msg(msg)?;
+                    writer.hasher.update(&writer.buf[start..writer.pos]);
+                    Ok(())
+                }
+                Record::ApplicationFinished(HandshakeMsg::Finished(data)) => {
+                    let mut encoded_data: [u8; 37] = [0u8; 37];
+                    encoded_data[0] = FINISHED_MSG;
+                    encoded_data[1..4].copy_from_slice(&U24::from_len(data.len())?.into_be_bytes());
+                    encoded_data[4..36].copy_from_slice(&data);
+                    encoded_data[36] = 0x16; // real record type of handshake message
+                    writer.hasher.update(&encoded_data[..36]); // we don't hash the real record type byte
+                    let (ciphertext, tag) = writer.encrypt_data(&encoded_data)?;
+                    writer.set_bytes(&ciphertext)?;
+                    writer.set_bytes(&tag)
+                }
+                Record::ApplicationData(mut data) => {
+                    data.push(0x17); // append real record type of application data
+                    let (ciphertext, tag) = writer.encrypt_data(&data)?;
+                    writer.set_bytes(&ciphertext)?;
+                    writer.set_bytes(&tag)
+                }
                 _ => todo!(),
             }?;
             Ok(None)
         })
     }
 
-    fn encode_alert_type(atype: &AlertType) -> u8 {
-        match atype {
-            AlertType::Warning => 0x01,
-            AlertType::Fatal => 0x02,
-            AlertType::Unknown(val) => *val,
+    fn encrypt_data(&mut self, data: &[u8]) -> Result<(Vec<u8>, [u8; 16]), Error> {
+        let key: &[u8; 32] = &self.client_traffic_secret.key.as_slice().try_into()?;
+        let seq_number = self.client_traffic_secret.seq_number.to_be_bytes();
+        let iv = &self.client_traffic_secret.iv;
+        let mut nonce = [0u8; 12];
+        for i in 0..12 {
+            if i < 4 {
+                nonce[i] = 0x0 ^ iv[i];
+            } else {
+                nonce[i] = seq_number[i - 4] ^ iv[i];
+            }
         }
-    }
-
-    fn encode_alert_desc(adesc: &AlertDescription) -> u8 {
-        match adesc {
-            AlertDescription::HandshakeFailure => 0x28,
-            AlertDescription::IllegalParameter => 0x2f,
-            AlertDescription::DecodeError => 0x32,
-            AlertDescription::DecryptError => 0x33,
-            AlertDescription::ProtocolVersion => 0x46,
-            AlertDescription::MissingExtension => 0x6d,
-            AlertDescription::Unknown(val) => *val,
-        }
+        let len = (data.len() as u16 + 16).to_be_bytes(); // +16 for the tag length
+        let aad = [0x17, 0x03, 0x03, len[0], len[1]];
+        let (ciphertext, tag) = aead::chacha20_aead_encrypt(&key, &nonce, &aad, data)?;
+        self.client_traffic_secret.seq_number += 1;
+        Ok((ciphertext, tag))
     }
 
     fn encode_msg(&mut self, msg: HandshakeMsg) -> Result<(), Error> {
@@ -501,7 +517,7 @@ impl TlsStream {
                 Record::Handshake(msg)
             }
             0x17 => {
-                self.decrypt_data(ctype, len)?;
+                self.decrypt_data(len)?;
                 let msg = self.decode_handshake_msg()?;
                 Record::Handshake(msg)
             }
@@ -510,7 +526,7 @@ impl TlsStream {
         Ok(res)
     }
 
-    fn decrypt_data(&mut self, ctype: u8, len: &[u8; 2]) -> Result<(), Error> {
+    fn decrypt_data(&mut self, len: &[u8; 2]) -> Result<(), Error> {
         let key: &[u8; 32] = &self.server_traffic_secert.key.as_slice().try_into()?;
         let seq_number = self.server_traffic_secert.seq_number.to_be_bytes();
         let iv = &self.server_traffic_secert.iv;
@@ -522,7 +538,7 @@ impl TlsStream {
                 nonce[i] = seq_number[i - 4] ^ iv[i];
             }
         }
-        let aad = [ctype, 0x03, 0x03, len[0], len[1]];
+        let aad = [0x17, 0x03, 0x03, len[0], len[1]];
         let encrypted_record = &self.buf[0..self.len];
         let split = encrypted_record.len() - 16;
         let ciphertext = &encrypted_record[..split];
@@ -763,7 +779,8 @@ enum Record {
     ChangeCipherSpec,
     Alert(AlertType, AlertDescription),
     Handshake(HandshakeMsg),
-    ApplicationData,
+    ApplicationFinished(HandshakeMsg),
+    ApplicationData(Vec<u8>),
 }
 
 #[derive(Debug)]
