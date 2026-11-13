@@ -587,6 +587,7 @@ impl TlsStream {
 
     fn decode_alert_desc(val: u8) -> AlertDescription {
         match val {
+            0x00 => AlertDescription::CloseNotify,
             0x28 => AlertDescription::HandshakeFailure,
             0x2f => AlertDescription::IllegalParameter,
             0x32 => AlertDescription::DecodeError,
@@ -795,6 +796,7 @@ impl Read for TlsStream {
                 buf[..data.len()].copy_from_slice(&data);
                 Ok(data.len())
             }
+            Record::Alert(AlertType::Warning, AlertDescription::CloseNotify) => Ok(0),
             Record::Alert(atype, adesc) => Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
@@ -893,6 +895,7 @@ enum AlertType {
 
 #[derive(Debug)]
 enum AlertDescription {
+    CloseNotify,
     HandshakeFailure,
     IllegalParameter,
     DecodeError,
