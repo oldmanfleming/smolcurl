@@ -174,12 +174,12 @@ impl TlsStream {
                             signature
                         );
 
-                        // certs::verify_certificate(
-                        //     hostname,
-                        //     certificate_entries,
-                        //     signature,
-                        //     cert_hash,
-                        // )?;
+                        certs::verify_certificate(
+                            hostname,
+                            certificate_entries,
+                            signature,
+                            cert_hash,
+                        )?;
 
                         verify_hash
                     }
@@ -535,7 +535,7 @@ impl TlsStream {
                         Record::Handshake(msgs)
                     }
                     0x17 => Record::ApplicationData(self.buf[..self.len].to_vec()),
-                    _ => bail!("unexpected real record type encountered"),
+                    _ => bail!("unexpected real record type encountered {}", real_type),
                 }
             }
             other => bail!("unexpected response content type: {}", other),
