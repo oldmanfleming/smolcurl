@@ -1,1 +1,2 @@
-pub mod stream;
+pub(crate) mod certs;
+pub(crate) mod stream;

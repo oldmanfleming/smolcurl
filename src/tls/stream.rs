@@ -8,6 +8,7 @@ use anyhow::{Context, Error, anyhow, bail};
 use crate::{
     bytes::{ByteLen, U24},
     crypto::{self, aead, hkdf, hmac, sha256::Sha256, x25519},
+    tls::certs::{self, CertificateEntry},
 };
 
 type TlsVersion = u16;
@@ -151,12 +152,17 @@ impl TlsStream {
             ),
         }
 
+        // certificate verification step
+        // receive both the certificate and certificate verify handshake messages before processing
         match self.recv_handshake_msg()? {
             HandshakeMsg::Certificate(certificate_entries) => {
                 println!(
                     "received certificate message with entries: {:?}",
                     certificate_entries
                 );
+                if certificate_entries.is_empty() {
+                    bail!("did not get any certificate entries");
+                }
 
                 self.hasher.update(&self.buf[..self.pos]);
 
@@ -169,7 +175,12 @@ impl TlsStream {
 
                         let transcript_hash = self.hasher.finalize();
 
-                        // TODO: verify certificate
+                        certs::verify_certificate(
+                            hostname,
+                            certificate_entries,
+                            signature,
+                            transcript_hash,
+                        )?;
 
                         self.hasher.update(&self.buf[..self.pos]);
                     }
@@ -765,12 +776,6 @@ impl TrafficSecret {
             seq_number: 0,
         })
     }
-}
-
-#[derive(Debug)]
-struct CertificateEntry {
-    data: Vec<u8>,
-    extensions: Vec<u8>,
 }
 
 #[derive(Debug)]
