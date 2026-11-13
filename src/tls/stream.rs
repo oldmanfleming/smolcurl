@@ -115,7 +115,7 @@ impl TlsStream {
         // receive ServerHello on it's own record
         match self.recv_handshake_msgs()?.remove(0) {
             HandshakeMsg::ServerHello((server_pub_key, hash)) => {
-                println!("received server hello with pub key: {:?}", server_pub_key);
+                println!("received server hello");
 
                 let early_secret = hkdf::extract(Some(&[0u8; 32]), &[0u8; 32]);
                 let ecdhe = x25519::x25519(client_priv_key, server_pub_key);
@@ -146,8 +146,8 @@ impl TlsStream {
         }
 
         match handshake_msgs.remove(0) {
-            HandshakeMsg::EncryptedExtensions(exts) => {
-                println!("received encrypted extensions message: {:?}", exts); // not supported yet
+            HandshakeMsg::EncryptedExtensions(..) => {
+                println!("received encrypted extensions message"); // not supported yet
             }
             r => bail!(
                 "received unexpected record when expecting encrypted extensions: {:?}",
@@ -159,20 +159,14 @@ impl TlsStream {
         // receive both the certificate and certificate verify handshake messages before processing
         let verify_hash = match handshake_msgs.remove(0) {
             HandshakeMsg::Certificate((certificate_entries, cert_hash)) => {
-                println!(
-                    "received certificate message with entries: {:?}",
-                    certificate_entries
-                );
+                println!("received certificate message");
                 if certificate_entries.is_empty() {
                     bail!("did not get any certificate entries");
                 }
 
                 match handshake_msgs.remove(0) {
                     HandshakeMsg::CertificateVerify((signature, verify_hash)) => {
-                        println!(
-                            "received certificate verify message with signature: {:?}",
-                            signature
-                        );
+                        println!("received certificate verify message");
 
                         certs::verify_certificate(
                             hostname,
@@ -198,10 +192,7 @@ impl TlsStream {
         // receive and verify server finished message
         let finished_hash = match handshake_msgs.remove(0) {
             HandshakeMsg::ServerFinished((server_verify_data, finished_hash)) => {
-                println!(
-                    "received finished message with verification data: {:?}",
-                    server_verify_data
-                );
+                println!("received finished message");
 
                 let finished_key = crypto::hkdf_expand_label(
                     &self.server_traffic_secert.secret,
@@ -867,6 +858,7 @@ enum Record {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum HandshakeMsg {
     ClientHello(CipherSuite, Vec<HandshakeExtension>),
     ServerHello(([u8; 32], [u8; 32])),
