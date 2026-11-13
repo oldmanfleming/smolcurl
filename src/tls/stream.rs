@@ -535,6 +535,13 @@ impl TlsStream {
                         Record::Handshake(msgs)
                     }
                     0x17 => Record::ApplicationData(self.buf[..self.len].to_vec()),
+                    0x15 => {
+                        let [atype, adesc, ..] = self.buf;
+                        Record::Alert(
+                            Self::decode_alert_type(atype),
+                            Self::decode_alert_desc(adesc),
+                        )
+                    }
                     _ => bail!("unexpected real record type encountered {}", real_type),
                 }
             }
