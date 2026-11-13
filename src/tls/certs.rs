@@ -95,9 +95,14 @@ fn verify_chain(
     certs: &Vec<X509Certificate<'_>>,
     leaf_cert: &X509Certificate<'_>,
 ) -> Result<(), Error> {
-    // verify the leaf certificate is from a trusted certificate authority
+    // Verify the leaf certificate is from a trusted certificate authority.
+    // Signature verification here is delegated to x509-parser's verify_signature
+    // rather than hand-rolled since chains mix algorithms (RSA, P-256, P-384, ...)
+    // our own ecdsa_verify_p256 can't cover.
+    // The CertificateVerify check above stays hand-rolled
+    // since that one is guaranteed P-256/SHA-256 by our own SignatureAlgorithms offer.
     let mut current = leaf_cert;
-    for i in 1..MAX_CERT_CHAIN_LOOP {
+    for _ in 0..MAX_CERT_CHAIN_LOOP {
         if !current.validity().is_valid() {
             bail!("provided certificate is not valid");
         }
@@ -106,21 +111,12 @@ fn verify_chain(
             .iter()
             .find(|root| root.subject.as_ref() == issuer_der)
         {
-            if current.signature_algorithm.algorithm
-                != x509_parser::oid_registry::OID_SIG_ECDSA_WITH_SHA256
-            {
-                bail!("unsupported signature algorithm in chain");
-            }
             let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(
                 anchor.subject_public_key_info.as_ref(),
             )?;
-            if !ecdsa::ecdsa_verify_p256(
-                spki.subject_public_key.data.as_ref().try_into()?,
-                current.tbs_certificate.as_ref(),
-                &current.signature_value.data,
-            ) {
-                bail!("failed to verify certificate chain");
-            }
+            current
+                .verify_signature(Some(&spki))
+                .context("failed to verify certificate chain")?;
             return Ok(());
         } else if let Some(intermediate) = certs[1..]
             .iter()
@@ -133,22 +129,13 @@ fn verify_chain(
             {
                 bail!("issuer is not a CA");
             }
-            if !ecdsa::ecdsa_verify_p256(
-                intermediate
-                    .public_key()
-                    .subject_public_key
-                    .data
-                    .as_ref()
-                    .try_into()?,
-                current.tbs_certificate.as_ref(),
-                &current.signature_value.data,
-            ) {
-                bail!("failed to verify certificate chain");
-            }
+            current
+                .verify_signature(Some(intermediate.public_key()))
+                .context("failed to verify certificate chain")?;
+            current = intermediate;
         } else {
             bail!("unknown certificate authority");
         }
-        current = &certs[i];
     }
     bail!("certificate chain too long")
 }
