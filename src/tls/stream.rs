@@ -795,6 +795,13 @@ impl Read for TlsStream {
                 buf[..data.len()].copy_from_slice(&data);
                 Ok(data.len())
             }
+            Record::Alert(atype, adesc) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "received alert during application data read {:?} {:?}",
+                    atype, adesc
+                ),
+            )),
             _ => todo!(),
         }
     }
