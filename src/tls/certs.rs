@@ -112,9 +112,8 @@ fn verify_chain(
             .iter()
             .find(|root| root.subject.as_ref() == issuer_any.data)
         {
-            let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(
-                anchor.subject_public_key_info.as_ref(),
-            )?;
+            let full_spki_der = wrap_der_sequence(anchor.subject_public_key_info.as_ref());
+            let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&full_spki_der)?;
             current
                 .verify_signature(Some(&spki))
                 .context("failed to verify certificate chain")?;
@@ -139,4 +138,18 @@ fn verify_chain(
         }
     }
     bail!("certificate chain too long")
+}
+
+fn wrap_der_sequence(content: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x30u8];
+    if content.len() < 128 {
+        out.push(content.len() as u8);
+    } else {
+        let be = (content.len() as u64).to_be_bytes();
+        let trimmed: Vec<u8> = be.iter().copied().skip_while(|&b| b == 0).collect();
+        out.push(0x80 | trimmed.len() as u8);
+        out.extend_from_slice(&trimmed);
+    }
+    out.extend_from_slice(content);
+    out
 }
