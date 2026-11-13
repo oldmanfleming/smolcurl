@@ -29,6 +29,7 @@ const HOST_NAME: ServerNameType = 0x00;
 
 const CLIENT_HELLO_MSG: HandshakeType = 1;
 const SERVER_HELLO_MSG: HandshakeType = 2;
+const NEW_SESSION_TICKET_MSG: HandshakeType = 4;
 const ENCRYPTED_EXTENSIONS_MSG: HandshakeType = 8;
 const CERTIFICATE_MSG: HandshakeType = 11;
 const CERTIFICATE_VERIFY_MSG: HandshakeType = 15;
@@ -106,19 +107,15 @@ impl TlsStream {
             exts.push(HandshakeExtension::ServerName(hostname.to_string()));
         }
         let hello = HandshakeMsg::ClientHello(TLS_CHACHA20_POLY1305_SHA256, exts);
-        let req = Record::Handshake(hello);
+        let req = Record::Handshake(vec![hello]);
 
         println!("sending client hello: {:?}", req);
         self.write_record(req)?;
 
-        match self.recv_handshake_msg()? {
-            HandshakeMsg::ServerHello(server_pub_key) => {
+        // receive ServerHello on it's own record
+        match self.recv_handshake_msgs()?.remove(0) {
+            HandshakeMsg::ServerHello((server_pub_key, hash)) => {
                 println!("received server hello with pub key: {:?}", server_pub_key);
-
-                // update the transcript hash with server hello
-                // buffer is already the inner msg part only
-                self.hasher.update(&self.buf[..self.pos]);
-                let transcript_hash = self.hasher.finalize();
 
                 let early_secret = hkdf::extract(Some(&[0u8; 32]), &[0u8; 32]);
                 let ecdhe = x25519::x25519(client_priv_key, server_pub_key);
@@ -129,7 +126,7 @@ impl TlsStream {
                         &ecdhe,
                         CLIENT_HS_TRAFFIC_LABEL,
                         SERVER_HS_TRAFFIC_LABEL,
-                        transcript_hash,
+                        hash,
                     )?;
                 self.handshake_secret = handshake_secret;
                 self.client_traffic_secret = client_hs_traffic_secret;
@@ -141,10 +138,16 @@ impl TlsStream {
             ),
         };
 
-        match self.recv_handshake_msg()? {
+        // We expect all 4 of: EncryptedExtensions, Certificate, CertificateVerify and ServerFinished to arrive at the same time.
+        // They can arrive spanning multiple records or within the same record
+        let mut handshake_msgs: Vec<HandshakeMsg> = vec![];
+        while handshake_msgs.len() < 4 {
+            handshake_msgs.append(&mut self.recv_handshake_msgs()?);
+        }
+
+        match handshake_msgs.remove(0) {
             HandshakeMsg::EncryptedExtensions(exts) => {
-                println!("received encrypted extensions message: {:?}", exts);
-                self.hasher.update(&self.buf[..self.pos]);
+                println!("received encrypted extensions message: {:?}", exts); // not supported yet
             }
             r => bail!(
                 "received unexpected record when expecting encrypted extensions: {:?}",
@@ -154,8 +157,8 @@ impl TlsStream {
 
         // certificate verification step
         // receive both the certificate and certificate verify handshake messages before processing
-        match self.recv_handshake_msg()? {
-            HandshakeMsg::Certificate(certificate_entries) => {
+        let verify_hash = match handshake_msgs.remove(0) {
+            HandshakeMsg::Certificate((certificate_entries, cert_hash)) => {
                 println!(
                     "received certificate message with entries: {:?}",
                     certificate_entries
@@ -164,25 +167,21 @@ impl TlsStream {
                     bail!("did not get any certificate entries");
                 }
 
-                self.hasher.update(&self.buf[..self.pos]);
-
-                match self.recv_handshake_msg()? {
-                    HandshakeMsg::CertificateVerify(signature) => {
+                match handshake_msgs.remove(0) {
+                    HandshakeMsg::CertificateVerify((signature, verify_hash)) => {
                         println!(
                             "received certificate verify message with signature: {:?}",
                             signature
                         );
 
-                        let transcript_hash = self.hasher.finalize();
-
                         certs::verify_certificate(
                             hostname,
                             certificate_entries,
                             signature,
-                            transcript_hash,
+                            cert_hash,
                         )?;
 
-                        self.hasher.update(&self.buf[..self.pos]);
+                        verify_hash
                     }
                     r => bail!(
                         "received unexpected record when expecting certificate verify: {:?}",
@@ -194,24 +193,23 @@ impl TlsStream {
                 "received unexpected record when expecting certificate: {:?}",
                 r
             ),
-        }
+        };
 
         // receive and verify server finished message
-        match self.recv_handshake_msg()? {
-            HandshakeMsg::Finished(server_verify_data) => {
+        let finished_hash = match handshake_msgs.remove(0) {
+            HandshakeMsg::ServerFinished((server_verify_data, finished_hash)) => {
                 println!(
                     "received finished message with verification data: {:?}",
                     server_verify_data
                 );
 
-                let transcript_hash = self.hasher.finalize();
                 let finished_key = crypto::hkdf_expand_label(
                     &self.server_traffic_secert.secret,
                     b"finished",
                     b"",
                     32,
                 )?;
-                let client_verify_data = hmac::hmac_sha256(&finished_key, &transcript_hash);
+                let client_verify_data = hmac::hmac_sha256(&finished_key, &verify_hash);
 
                 // validation must be a constant time comparison
                 let mut valid = true;
@@ -228,30 +226,29 @@ impl TlsStream {
                     )
                 }
 
-                self.hasher.update(&self.buf[..self.pos]);
+                finished_hash
             }
             r => bail!(
                 "received unexpected record when expecting finished: {:?}",
                 r
             ),
-        }
+        };
 
         // construct application secrets and send client finished message
-        let transcript_hash = self.hasher.finalize();
         let (master_secret, client_ap_traffic_secret, server_ap_traffic_secret) =
             Self::extract_secrets(
                 &self.handshake_secret,
                 &[0u8; 32],
                 CLIENT_AP_TRAFFIC_LABEL,
                 SERVER_AP_TRAFFIC_LABEL,
-                transcript_hash,
+                finished_hash,
             )?;
 
         let finished_key =
             crypto::hkdf_expand_label(&self.client_traffic_secret.secret, b"finished", b"", 32)?;
-        let verify_data = hmac::hmac_sha256(&finished_key, &transcript_hash);
+        let verify_data = hmac::hmac_sha256(&finished_key, &finished_hash);
 
-        let finished = HandshakeMsg::Finished(verify_data);
+        let finished = HandshakeMsg::ClientFinished(verify_data);
         self.write_record(Record::ApplicationFinished(finished))?;
 
         self.master_secret = master_secret;
@@ -285,13 +282,15 @@ impl TlsStream {
     fn encode_fragment(&mut self, record: Record) -> Result<(), Error> {
         self.encode_dyn_len_data::<u16>(|writer| {
             match record {
-                Record::Handshake(msg) => {
-                    let start = writer.pos;
-                    writer.encode_msg(msg)?;
-                    writer.hasher.update(&writer.buf[start..writer.pos]);
+                Record::Handshake(msgs) => {
+                    for msg in msgs.into_iter() {
+                        let start = writer.pos;
+                        writer.encode_msg(msg)?;
+                        writer.hasher.update(&writer.buf[start..writer.pos]);
+                    }
                     Ok(())
                 }
-                Record::ApplicationFinished(HandshakeMsg::Finished(data)) => {
+                Record::ApplicationFinished(HandshakeMsg::ClientFinished(data)) => {
                     let mut encoded_data: [u8; 37] = [0u8; 37];
                     encoded_data[0] = FINISHED_MSG;
                     encoded_data[1..4].copy_from_slice(&U24::from_len(data.len())?.into_be_bytes());
@@ -477,7 +476,7 @@ impl TlsStream {
         Ok(())
     }
 
-    fn recv_handshake_msg(&mut self) -> Result<HandshakeMsg, Error> {
+    fn recv_handshake_msgs(&mut self) -> Result<Vec<HandshakeMsg>, Error> {
         // Receive a record while handling potential alert and change cipher messages
         for _ in 0..MAX_HANDSHAKE_RESPONSE_RECORDS {
             let record = self.read_record()?;
@@ -487,8 +486,8 @@ impl TlsStream {
                 Record::ChangeCipherSpec => {
                     println!("received change cipher spec");
                 }
-                Record::Handshake(msg) => return Ok(msg),
-                other => println!("unexpected record type during handshake: {:?}", other),
+                Record::Handshake(msgs) => return Ok(msgs),
+                other => bail!("unexpected record type during handshake: {:?}", other), // could be a form of ddos. let's bail
             }
         }
         Err(anyhow!("didn't receive handshake message"))
@@ -524,20 +523,36 @@ impl TlsStream {
                 )
             }
             0x16 => {
-                let msg = self.decode_handshake_msg()?;
-                Record::Handshake(msg)
+                let mut msgs: Vec<HandshakeMsg> = vec![];
+                while self.pos < self.len {
+                    if let Some(msg) = self.decode_handshake_msg()? {
+                        msgs.push(msg);
+                    }
+                }
+                Record::Handshake(msgs)
             }
             0x17 => {
-                self.decrypt_data(len)?;
-                let msg = self.decode_handshake_msg()?;
-                Record::Handshake(msg)
+                let real_type = self.decrypt_data(len)?;
+                match real_type {
+                    0x16 => {
+                        let mut msgs: Vec<HandshakeMsg> = vec![];
+                        while self.pos < self.len {
+                            if let Some(msg) = self.decode_handshake_msg()? {
+                                msgs.push(msg);
+                            }
+                        }
+                        Record::Handshake(msgs)
+                    }
+                    0x17 => todo!(),
+                    _ => bail!("unexpected real record type encountered"),
+                }
             }
             other => bail!("unexpected response content type: {}", other),
         };
         Ok(res)
     }
 
-    fn decrypt_data(&mut self, len: &[u8; 2]) -> Result<(), Error> {
+    fn decrypt_data(&mut self, len: &[u8; 2]) -> Result<u8, Error> {
         let key: &[u8; 32] = &self.server_traffic_secert.key.as_slice().try_into()?;
         let seq_number = self.server_traffic_secert.seq_number.to_be_bytes();
         let iv = &self.server_traffic_secert.iv;
@@ -555,9 +570,22 @@ impl TlsStream {
         let ciphertext = &encrypted_record[..split];
         let tag: &[u8; 16] = &encrypted_record[split..].try_into()?;
         let decrypted_record = aead::chacha20_aead_decrypt(&key, &nonce, &aad, ciphertext, tag)?;
+
         self.server_traffic_secert.seq_number += 1;
         self.buf[0..decrypted_record.len()].copy_from_slice(&decrypted_record);
-        Ok(())
+
+        let mut content_len = decrypted_record.len();
+        while content_len > 0 && decrypted_record[content_len - 1] == 0 {
+            content_len -= 1;
+        }
+        if content_len == 0 {
+            bail!("decrypted record missing real content type byte");
+        }
+        let real_type = decrypted_record[content_len - 1];
+        content_len -= 1; // drop the real_type byte itself
+        self.len = content_len;
+
+        Ok(real_type)
     }
 
     fn decode_alert_type(val: u8) -> AlertType {
@@ -580,7 +608,8 @@ impl TlsStream {
         }
     }
 
-    fn decode_handshake_msg(&mut self) -> Result<HandshakeMsg, Error> {
+    fn decode_handshake_msg(&mut self) -> Result<Option<HandshakeMsg>, Error> {
+        let start = self.pos;
         // msg header is 1 byte type + 3 byte length
         // we parse the type in-place and then mask it out of the 32bit parsed length
         let msg_type = self.decode_data::<u8>()?;
@@ -647,8 +676,12 @@ impl TlsStream {
                     bail!("server does not support TLS1.3: {:?}", version);
                 }
 
+                self.hasher.update(&self.buf[start..self.pos]);
+                let tx_hash = self.hasher.finalize();
                 match key_share {
-                    Some((X25519, pub_key)) => Ok(HandshakeMsg::ServerHello(pub_key)),
+                    Some((X25519, pub_key)) => {
+                        Ok(Some(HandshakeMsg::ServerHello((pub_key, tx_hash))))
+                    }
                     Some((key_group, _)) => {
                         bail!("unexpected key group received from server: {}", key_group)
                     }
@@ -673,7 +706,8 @@ impl TlsStream {
                         }
                     }
                 }
-                Ok(HandshakeMsg::EncryptedExtensions(extensions))
+                self.hasher.update(&self.buf[start..self.pos]);
+                Ok(Some(HandshakeMsg::EncryptedExtensions(extensions)))
             }
             CERTIFICATE_MSG => {
                 let _certificate_request_context = self.decode_data::<u8>()?;
@@ -691,7 +725,12 @@ impl TlsStream {
                     });
                     pos += 3 + cert_data_len + 2 + extensions_len;
                 }
-                Ok(HandshakeMsg::Certificate(certificate_entries))
+                self.hasher.update(&self.buf[start..self.pos]);
+                let tx_hash = self.hasher.finalize();
+                Ok(Some(HandshakeMsg::Certificate((
+                    certificate_entries,
+                    tx_hash,
+                ))))
             }
             CERTIFICATE_VERIFY_MSG => {
                 let algorithm = self.decode_data::<u16>()?;
@@ -700,11 +739,20 @@ impl TlsStream {
                 }
                 let signature_len = self.decode_data::<u16>()?;
                 let signature = self.get_bytes(signature_len as usize)?.to_vec();
-                Ok(HandshakeMsg::CertificateVerify(signature))
+                self.hasher.update(&self.buf[start..self.pos]);
+                let tx_hash = self.hasher.finalize();
+                Ok(Some(HandshakeMsg::CertificateVerify((signature, tx_hash))))
             }
             FINISHED_MSG => {
                 let verify_data: [u8; 32] = self.get_bytes(len as usize)?.try_into()?;
-                Ok(HandshakeMsg::Finished(verify_data))
+                self.hasher.update(&self.buf[start..self.pos]);
+                let tx_hash = self.hasher.finalize();
+                Ok(Some(HandshakeMsg::ServerFinished((verify_data, tx_hash))))
+            }
+            NEW_SESSION_TICKET_MSG => {
+                println!("received new session ticket");
+                self.get_bytes(len as usize)?; // discard: no session resumption support
+                Ok(None)
             }
             m => bail!("received unsupported handshake message response: {}", m),
         }
@@ -788,7 +836,7 @@ enum Record {
     Invalid,
     ChangeCipherSpec,
     Alert(AlertType, AlertDescription),
-    Handshake(HandshakeMsg),
+    Handshake(Vec<HandshakeMsg>),
     ApplicationFinished(HandshakeMsg),
     ApplicationData(Vec<u8>),
 }
@@ -796,13 +844,12 @@ enum Record {
 #[derive(Debug)]
 enum HandshakeMsg {
     ClientHello(CipherSuite, Vec<HandshakeExtension>),
-    ServerHello([u8; 32]),
-    _NewSessionTicket,
+    ServerHello(([u8; 32], [u8; 32])),
     EncryptedExtensions(Vec<HandshakeExtension>),
-    Certificate(Vec<CertificateEntry>),
-    CertificateVerify(Signature),
-    Finished([u8; 32]),
-    _KeyUpdated,
+    Certificate((Vec<CertificateEntry>, [u8; 32])),
+    CertificateVerify((Signature, [u8; 32])),
+    ServerFinished(([u8; 32], [u8; 32])),
+    ClientFinished([u8; 32]),
 }
 
 #[derive(Debug)]
