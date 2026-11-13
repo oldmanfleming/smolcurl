@@ -887,6 +887,7 @@ enum HandshakeExtension {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum AlertType {
     Warning,
     Fatal,
@@ -894,6 +895,7 @@ enum AlertType {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum AlertDescription {
     CloseNotify,
     HandshakeFailure,

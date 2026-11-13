@@ -28,6 +28,8 @@ const A: U256 = [
     0x0000000000000000,
     0xffffffff00000001,
 ];
+
+#[allow(dead_code)]
 const B: U256 = [
     0x3bce3c3e27d2604b,
     0x651d06b0cc53b0f6,
@@ -53,7 +55,11 @@ const N: U256 = [
     0xffffffff00000000,
 ];
 
-pub(crate) fn ecdsa_verify_p256(public_key: [u8; 65], message: &[u8], signature_der: &[u8]) -> bool {
+pub(crate) fn ecdsa_verify_p256(
+    public_key: [u8; 65],
+    message: &[u8],
+    signature_der: &[u8],
+) -> bool {
     let q = match parse_public_key(public_key) {
         Ok(q) => q,
         Err(_) => return false,
@@ -286,6 +292,7 @@ fn u256_from_be_bytes(bytes: [u8; 32]) -> U256 {
     limbs
 }
 
+#[allow(dead_code)]
 fn u256_to_be_bytes(x: U256) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     for i in 0..4 {
@@ -400,13 +407,19 @@ mod tests {
 
     #[test]
     fn mod_mul_small_values() {
-        assert_eq!(mod_mul([2, 0, 0, 0], [3, 0, 0, 0], [7, 0, 0, 0]), [6, 0, 0, 0]);
+        assert_eq!(
+            mod_mul([2, 0, 0, 0], [3, 0, 0, 0], [7, 0, 0, 0]),
+            [6, 0, 0, 0]
+        );
     }
 
     #[test]
     fn mod_pow_small_values() {
         // 3^5 = 243, 243 mod 13 = 9
-        assert_eq!(mod_pow([3, 0, 0, 0], [5, 0, 0, 0], [13, 0, 0, 0]), [9, 0, 0, 0]);
+        assert_eq!(
+            mod_pow([3, 0, 0, 0], [5, 0, 0, 0], [13, 0, 0, 0]),
+            [9, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -455,7 +468,9 @@ mod tests {
     fn ecdsa_verify_p256_accepts_valid_signature() {
         let public_key: [u8; 65] = hex("04a3d295e2721d3c27330d7f77a4169c358a376cb4e02587a360e41dcc2376b26636bc1b2d6d157a535b94ac0ffa51d1ba4025a10775fae9d5c44005cb3ded64f7").try_into().unwrap();
         let message = b"smolcurl ecdsa test vector";
-        let signature_der = hex("30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275");
+        let signature_der = hex(
+            "30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275",
+        );
 
         assert!(ecdsa_verify_p256(public_key, message, &signature_der));
     }
@@ -465,7 +480,9 @@ mod tests {
         let public_key: [u8; 65] = hex("04a3d295e2721d3c27330d7f77a4169c358a376cb4e02587a360e41dcc2376b26636bc1b2d6d157a535b94ac0ffa51d1ba4025a10775fae9d5c44005cb3ded64f7").try_into().unwrap();
         let message = b"smolcurl ecdsa test vector";
         // last byte of s flipped relative to the valid vector above
-        let signature_der = hex("30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106274");
+        let signature_der = hex(
+            "30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106274",
+        );
 
         assert!(!ecdsa_verify_p256(public_key, message, &signature_der));
     }
@@ -474,7 +491,9 @@ mod tests {
     fn ecdsa_verify_p256_rejects_wrong_message() {
         let public_key: [u8; 65] = hex("04a3d295e2721d3c27330d7f77a4169c358a376cb4e02587a360e41dcc2376b26636bc1b2d6d157a535b94ac0ffa51d1ba4025a10775fae9d5c44005cb3ded64f7").try_into().unwrap();
         let message = b"not the signed message";
-        let signature_der = hex("30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275");
+        let signature_der = hex(
+            "30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275",
+        );
 
         assert!(!ecdsa_verify_p256(public_key, message, &signature_der));
     }
@@ -484,7 +503,9 @@ mod tests {
     fn ecdsa_verify_p256_accepts_signature_with_padded_r() {
         let public_key: [u8; 65] = hex("04b1ea8fc70fbeddcdd5485be3421ae8c3f23c185734edd83b5b01ae610746ee755969ca711bf00102263747ec404e24e3a9216472ff03e7947ac7a582c73ba223").try_into().unwrap();
         let message = b"smolcurl padded-der test vector";
-        let signature_der = hex("3045022100c321b21c521a5c7c638411cbded17efec027e0f60b7bdaa6400b71e1348aaafe022041628043a6651f708e3ab81dab88ec0651c6a01a35e66164a22b859f424c65bd");
+        let signature_der = hex(
+            "3045022100c321b21c521a5c7c638411cbded17efec027e0f60b7bdaa6400b71e1348aaafe022041628043a6651f708e3ab81dab88ec0651c6a01a35e66164a22b859f424c65bd",
+        );
 
         assert!(ecdsa_verify_p256(public_key, message, &signature_der));
     }
@@ -495,7 +516,11 @@ mod tests {
         let message = b"smolcurl ecdsa test vector";
 
         assert!(!ecdsa_verify_p256(public_key, message, &[]));
-        assert!(!ecdsa_verify_p256(public_key, message, &[0x30, 0x02, 0x02, 0x01]));
+        assert!(!ecdsa_verify_p256(
+            public_key,
+            message,
+            &[0x30, 0x02, 0x02, 0x01]
+        ));
     }
 
     #[test]
@@ -503,7 +528,9 @@ mod tests {
         let mut public_key = [0u8; 65];
         public_key[0] = 0x02; // compressed-point prefix, unsupported by this project's scope
         let message = b"smolcurl ecdsa test vector";
-        let signature_der = hex("30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275");
+        let signature_der = hex(
+            "30450220040b9a4e1140703d7262300ea28816bb761f7430446f76080ebdbd7064efa25d022100945df143949ca73f77b10d56eb15fd4edd48793232db5c46a713dd2c20106275",
+        );
 
         assert!(!ecdsa_verify_p256(public_key, message, &signature_der));
     }

@@ -8,6 +8,7 @@ use crate::crypto::ecdsa;
 const MAX_CERT_CHAIN_LOOP: usize = 10;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct CertificateEntry {
     pub data: Vec<u8>,
     pub extensions: Vec<u8>,
