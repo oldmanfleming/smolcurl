@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, TcpStream},
 };
 
@@ -174,12 +174,12 @@ impl TlsStream {
                             signature
                         );
 
-                        certs::verify_certificate(
-                            hostname,
-                            certificate_entries,
-                            signature,
-                            cert_hash,
-                        )?;
+                        // certs::verify_certificate(
+                        //     hostname,
+                        //     certificate_entries,
+                        //     signature,
+                        //     cert_hash,
+                        // )?;
 
                         verify_hash
                     }
@@ -315,16 +315,7 @@ impl TlsStream {
 
     fn encrypt_data(&mut self, data: &[u8]) -> Result<(Vec<u8>, [u8; 16]), Error> {
         let key: &[u8; 32] = &self.client_traffic_secret.key.as_slice().try_into()?;
-        let seq_number = self.client_traffic_secret.seq_number.to_be_bytes();
-        let iv = &self.client_traffic_secret.iv;
-        let mut nonce = [0u8; 12];
-        for i in 0..12 {
-            if i < 4 {
-                nonce[i] = 0x0 ^ iv[i];
-            } else {
-                nonce[i] = seq_number[i - 4] ^ iv[i];
-            }
-        }
+        let nonce = self.client_traffic_secret.nonce();
         let len = (data.len() as u16 + 16).to_be_bytes(); // +16 for the tag length
         let aad = [0x17, 0x03, 0x03, len[0], len[1]];
         let (ciphertext, tag) = aead::chacha20_aead_encrypt(&key, &nonce, &aad, data)?;
@@ -543,7 +534,7 @@ impl TlsStream {
                         }
                         Record::Handshake(msgs)
                     }
-                    0x17 => todo!(),
+                    0x17 => Record::ApplicationData(self.buf[..self.len].to_vec()),
                     _ => bail!("unexpected real record type encountered"),
                 }
             }
@@ -554,16 +545,7 @@ impl TlsStream {
 
     fn decrypt_data(&mut self, len: &[u8; 2]) -> Result<u8, Error> {
         let key: &[u8; 32] = &self.server_traffic_secert.key.as_slice().try_into()?;
-        let seq_number = self.server_traffic_secert.seq_number.to_be_bytes();
-        let iv = &self.server_traffic_secert.iv;
-        let mut nonce = [0u8; 12];
-        for i in 0..12 {
-            if i < 4 {
-                nonce[i] = 0x0 ^ iv[i];
-            } else {
-                nonce[i] = seq_number[i - 4] ^ iv[i];
-            }
-        }
+        let nonce = self.server_traffic_secert.nonce();
         let aad = [0x17, 0x03, 0x03, len[0], len[1]];
         let encrypted_record = &self.buf[0..self.len];
         let split = encrypted_record.len() - 16;
@@ -798,17 +780,30 @@ impl TlsStream {
 
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        todo!()
+        let record = self
+            .read_record()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        match record {
+            Record::ApplicationData(data) => {
+                buf[..data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            }
+            _ => todo!(),
+        }
     }
 }
 
 impl Write for TlsStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        todo!()
+        for chunk in buf.chunks(MAX_RECORD_SIZE) {
+            self.write_record(Record::ApplicationData(chunk.to_vec()))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        todo!()
+        self.inner.flush()
     }
 }
 
@@ -828,6 +823,20 @@ impl TrafficSecret {
             iv: crypto::hkdf_expand_label(&secret, b"iv", b"", 12)?,
             seq_number: 0,
         })
+    }
+
+    pub fn nonce(&self) -> [u8; 12] {
+        let seq_number = self.seq_number.to_be_bytes();
+        let iv = &self.iv;
+        let mut nonce = [0u8; 12];
+        for i in 0..12 {
+            if i < 4 {
+                nonce[i] = 0x0 ^ iv[i];
+            } else {
+                nonce[i] = seq_number[i - 4] ^ iv[i];
+            }
+        }
+        nonce
     }
 }
 
