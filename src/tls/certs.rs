@@ -107,9 +107,10 @@ fn verify_chain(
             bail!("provided certificate is not valid");
         }
         let issuer_der = current.issuer().as_raw();
+        let (_, issuer_any) = x509_parser::asn1_rs::Any::from_der(issuer_der)?;
         if let Some(anchor) = webpki_roots::TLS_SERVER_ROOTS
             .iter()
-            .find(|root| root.subject.as_ref() == issuer_der)
+            .find(|root| root.subject.as_ref() == issuer_any.data)
         {
             let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(
                 anchor.subject_public_key_info.as_ref(),
