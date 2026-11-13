@@ -69,7 +69,7 @@ fn parse_hostport<'a>(scheme: &Scheme, hostport: &'a str) -> Result<(&'a str, u1
 fn resolve_port(scheme: &Scheme) -> u16 {
     match scheme {
         Scheme::Http => 80,
-        Scheme::Https => 553,
+        Scheme::Https => 453,
     }
 }
 

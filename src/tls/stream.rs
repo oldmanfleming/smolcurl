@@ -656,11 +656,22 @@ impl TlsStream {
                 }
             }
             ENCRYPTED_EXTENSIONS_MSG => {
-                let ext_len = self.decode_data::<u16>()?;
-                let mut extensions: Vec<HandshakeExtension> = vec![];
-                for _ in 0..ext_len {
-                    let ext = self.decode_data::<u8>()?;
-                    extensions.push(Self::decode_handshake_extension(ext))
+                let ext_len = usize::from(self.decode_data::<u16>()?);
+                let ext_end = self.pos + ext_len;
+                let extensions: Vec<HandshakeExtension> = vec![];
+                while self.pos < ext_end {
+                    let ext_type = self.decode_data::<u16>()?;
+                    let ext_data_len = usize::from(self.decode_data::<u16>()?);
+                    match ext_type {
+                        // handle whichever ones you care about, consuming exactly ext_data_len bytes
+                        _ => {
+                            println!(
+                                "unsupported extension type in encrypted extensions: {}",
+                                ext_type
+                            );
+                            self.pos += ext_data_len;
+                        }
+                    }
                 }
                 Ok(HandshakeMsg::EncryptedExtensions(extensions))
             }
@@ -696,12 +707,6 @@ impl TlsStream {
                 Ok(HandshakeMsg::Finished(verify_data))
             }
             m => bail!("received unsupported handshake message response: {}", m),
-        }
-    }
-
-    fn decode_handshake_extension(ext: u8) -> HandshakeExtension {
-        match ext {
-            _ => todo!(),
         }
     }
 
